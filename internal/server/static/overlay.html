@@ -126,7 +126,8 @@
 
     // ── WebSocket connection with auto-reconnect ─────────────────────────
     function connect() {
-      const wsURL = `ws://${location.host}/ws`;
+      const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsURL = `${wsProto}://${location.host}/ws`;
       const ws = new WebSocket(wsURL);
 
       ws.onopen    = () => console.log('[overlay] connected to', wsURL);
