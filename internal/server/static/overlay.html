@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chat Overlay</title>
+  <style>
+    /* ── Reset & transparent background for OBS Browser Source ── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: transparent;
+      overflow: hidden;
+      height: 100vh;
+      position: relative;
+    }
+
+    /* ── Chat container — anchored to bottom like jChat ── */
+    #chat_container {
+      width: calc(100% - 20px);
+      padding: 10px;
+      position: absolute;
+      bottom: 0;
+      overflow: hidden;
+      background-color: transparent;
+
+      /* jChat defaults: Segoe UI, 20px, bold, text shadow */
+      color: white;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      font-size: 20px;
+      font-weight: 800;
+      text-shadow: 2px 2px 2px black;
+      word-break: break-word;
+    }
+
+    /* ── One line per message ── */
+    .chat_line {
+      line-height: 30px;
+    }
+
+    /* Inline so username and message sit on the same line */
+    .user_info {
+      display: inline;
+    }
+
+    /* Username colour is set inline via style= per platform */
+    .nick {
+      /* color set per-message */
+    }
+
+    .colon {
+      margin-right: 5px;
+    }
+
+    /* Message text inherits colour (white) from container */
+    .message {
+      display: inline;
+    }
+
+    /* ── Fade-out animation ── */
+    @keyframes fadeOut {
+      to { opacity: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div id="chat_container"></div>
+
+  <script>
+    // ── Configuration via URL query parameters ────────────────────────────
+    // fade   = seconds before a message fades  (default: 20)
+    // size   = font size in px                 (default: 20)
+    // max    = max visible messages            (default: 100)
+    const p          = new URLSearchParams(location.search);
+    const MAX_MSGS   = parseInt(p.get('max')  || p.get('max_messages') || '100', 10);
+    const FONT_SIZE  = parseInt(p.get('size') || p.get('font_size')    || '20',  10);
+    const FADE_SECS  = parseFloat(p.get('fade') || '20');  // seconds, 0 = no fade
+
+    // Platform → username colour, matching jChat Twitch palette feel
+    const PLATFORM_COLORS = {
+      twitch:  '#9147ff',
+      youtube: '#ff4444',
+      kick:    '#53fc18',
+    };
+
+    // Apply font size override.
+    document.getElementById('chat_container').style.fontSize = FONT_SIZE + 'px';
+
+    // ── XSS-safe text escaping ────────────────────────────────────────────
+    function escapeHTML(str) {
+      const el = document.createElement('div');
+      el.textContent = str;
+      return el.innerHTML;
+    }
+
+    // ── Render a message ─────────────────────────────────────────────────
+    function addMessage(msg) {
+      const chat = document.getElementById('chat_container');
+      const color = PLATFORM_COLORS[msg.platform] || '#ffffff';
+
+      const line = document.createElement('div');
+      line.className = 'chat_line';
+      line.innerHTML =
+        `<span class="user_info">` +
+          `<span class="nick" style="color:${escapeHTML(color)}">${escapeHTML(msg.username)}</span>` +
+          `<span class="colon">:</span>` +
+        `</span>` +
+        `<span class="message">${escapeHTML(msg.message)}</span>`;
+
+      chat.appendChild(line);
+
+      // Trim oldest messages when the cap is exceeded.
+      while (chat.children.length > MAX_MSGS) {
+        chat.removeChild(chat.firstChild);
+      }
+
+      // Auto-fade and remove after FADE_SECS seconds (0 = never).
+      if (FADE_SECS > 0) {
+        setTimeout(() => {
+          line.style.transition = 'opacity 0.4s ease-out';
+          line.style.opacity = '0';
+          setTimeout(() => line.remove(), 400);
+        }, FADE_SECS * 1000);
+      }
+    }
+
+    // ── WebSocket connection with auto-reconnect ─────────────────────────
+    function connect() {
+      const wsURL = `ws://${location.host}/ws`;
+      const ws = new WebSocket(wsURL);
+
+      ws.onopen    = () => console.log('[overlay] connected to', wsURL);
+      ws.onmessage = (e) => { try { addMessage(JSON.parse(e.data)); } catch (_) {} };
+      ws.onerror   = (e) => console.error('[overlay] WebSocket error', e);
+      ws.onclose   = () => {
+        console.log('[overlay] connection lost — reconnecting in 3s');
+        setTimeout(connect, 3000);
+      };
+    }
+
+    connect();
+  </script>
+</body>
+</html>
