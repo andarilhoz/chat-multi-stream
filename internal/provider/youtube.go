@@ -17,6 +17,11 @@ import (
 	"github.com/magnogouveia/chat-multi-stream/internal/domain"
 )
 
+// errNotLive is returned by findLiveBroadcastViaRSS when the feed is reachable
+// but no active live stream is found. It is distinct from infrastructure errors
+// (network failures, HTTP errors) which warrant a search.list fallback.
+var errNotLive = fmt.Errorf("channel is not live")
+
 // defaultOfflineRetryInterval is the fallback polling interval used when the
 // channel is offline and no custom value was provided via config.
 const defaultOfflineRetryInterval = 60 * time.Second
@@ -84,14 +89,24 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 		// ── Step 1: RSS pre-check (0 quota units) ────────────────────────────
 		// The channel Atom feed is public and free. We pull the latest video IDs
 		// and check them with one videos.list call (1 unit) for an active chat.
-		// search.list (100 units) is only used as a fallback if the RSS check fails.
+		// search.list (100 units) is used ONLY when the RSS feed itself is broken.
 		videoID, liveChatID, err := findLiveBroadcastViaRSS(ctx, svc, channelID)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			// Fall back to search.list (100 units) when RSS yields nothing.
-			log.Printf("[youtube] RSS check for %q: %v — falling back to search.list", channelName, err)
+			if err == errNotLive {
+				// RSS confirmed the channel is offline — no fallback needed.
+				log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(offlineRetry):
+				}
+				continue
+			}
+			// RSS feed itself failed (network/HTTP error) — fall back to search.list (100 units).
+			log.Printf("[youtube] RSS unavailable for %q (%v) — falling back to search.list", channelName, err)
 			videoID, err = findActiveLiveBroadcast(ctx, svc, channelID)
 			if err != nil {
 				log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
@@ -202,7 +217,8 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 			return item.Id, item.LiveStreamingDetails.ActiveLiveChatId, nil
 		}
 	}
-	return "", "", fmt.Errorf("no active live stream in recent videos for channel %s", channelID)
+	// Feed was reachable and videos were checked — channel is simply not live.
+	return "", "", errNotLive
 }
 
 // findActiveLiveBroadcast searches for a currently live video on the given channel.
