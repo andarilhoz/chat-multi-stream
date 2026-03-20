@@ -81,6 +81,10 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 	}
 	log.Printf("[youtube] channel %q → ID %s", channelName, channelID)
 
+	// skipVideoID is the last video that ended; we skip it in RSS checks until the
+	// API cache clears and a different (genuinely live) video appears.
+	var skipVideoID string
+
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -90,7 +94,7 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 		// The channel Atom feed is public and free. We pull the latest video IDs
 		// and check them with one videos.list call (1 unit) for an active chat.
 		// search.list (100 units) is used ONLY when the RSS feed itself is broken.
-		videoID, liveChatID, err := findLiveBroadcastViaRSS(ctx, svc, channelID)
+		videoID, liveChatID, err := findLiveBroadcastViaRSS(ctx, svc, channelID, skipVideoID)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -129,11 +133,14 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 			}
 		}
 		log.Printf("[youtube] channel %q is live: video %s, chat %s", channelName, videoID, liveChatID)
+		skipVideoID = "" // clear: we have a confirmed new stream
 
 		// ── Step 2: poll chat until stream ends ───────────────────────────────
 		if err := pollLiveChat(ctx, svc, liveChatID, channelName, channelID, out); err != nil && ctx.Err() == nil {
 			log.Printf("[youtube] chat ended for %q (%v) — watching for next stream", channelName, err)
 		}
+		// Mark this video as dead so stale API cache doesn't re-detect it as live.
+		skipVideoID = videoID
 	}
 }
 
@@ -167,7 +174,7 @@ func resolveYouTubeChannelID(ctx context.Context, svc *youtube.Service, name str
 // feed (zero API quota cost) followed by a single videos.list call (1 quota unit).
 // It returns the video ID and active live chat ID, or a non-nil error when the channel
 // is offline or the feed is temporarily unavailable.
-func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelID string) (videoID, liveChatID string, err error) {
+func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelID string, skipVideoID string) (videoID, liveChatID string, err error) {
 	feedURL := "https://www.youtube.com/feeds/videos.xml?channel_id=" + url.QueryEscape(channelID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
 	if err != nil {
@@ -213,6 +220,12 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 		return "", "", fmt.Errorf("videos.list: %w", err)
 	}
 	for _, item := range vResp.Items {
+		// Skip the video that was most recently polled — YouTube's API can keep
+		// ActiveLiveChatId populated for minutes after a stream ends, so we
+		// ignore it until the loop finds a genuinely different live video.
+		if item.Id == skipVideoID {
+			continue
+		}
 		d := item.LiveStreamingDetails
 		// ActualEndTime is set once the broadcast has concluded; an active stream
 		// has an empty ActualEndTime and a non-empty ActiveLiveChatId.
