@@ -1,6 +1,6 @@
 services:
   chat-multi-stream:
-    build: .
+    image: ghcr.io/andarilhoz/chat-multi-stream:latest
     container_name: chat-multi-stream
     restart: unless-stopped
     ports:
