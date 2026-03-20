@@ -213,8 +213,11 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 		return "", "", fmt.Errorf("videos.list: %w", err)
 	}
 	for _, item := range vResp.Items {
-		if item.LiveStreamingDetails != nil && item.LiveStreamingDetails.ActiveLiveChatId != "" {
-			return item.Id, item.LiveStreamingDetails.ActiveLiveChatId, nil
+		d := item.LiveStreamingDetails
+		// ActualEndTime is set once the broadcast has concluded; an active stream
+		// has an empty ActualEndTime and a non-empty ActiveLiveChatId.
+		if d != nil && d.ActiveLiveChatId != "" && d.ActualEndTime == "" {
+			return item.Id, d.ActiveLiveChatId, nil
 		}
 	}
 	// Feed was reachable and videos were checked — channel is simply not live.
