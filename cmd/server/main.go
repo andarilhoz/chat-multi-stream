@@ -38,8 +38,8 @@ func main() {
 	}
 
 	if cfg.YouTubeAPIKey != "" && cfg.YouTubeChannel != "" {
-		providers = append(providers, provider.NewYouTubeProvider(cfg.YouTubeAPIKey, cfg.YouTubeChannel))
-		log.Printf("youtube: channel → %s", cfg.YouTubeChannel)
+		providers = append(providers, provider.NewYouTubeProvider(cfg.YouTubeAPIKey, cfg.YouTubeChannel, cfg.YouTubeOfflineRetry))
+		log.Printf("youtube: channel → %s (offline retry: %s)", cfg.YouTubeChannel, cfg.YouTubeOfflineRetry)
 	}
 
 	if cfg.KickChannel != "" {

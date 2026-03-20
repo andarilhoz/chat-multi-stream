@@ -3,7 +3,11 @@ package provider
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -13,26 +17,32 @@ import (
 	"github.com/magnogouveia/chat-multi-stream/internal/domain"
 )
 
-// offlineRetryInterval is how long the YouTube provider waits between checks
-// when the configured channel is not currently live.
-const offlineRetryInterval = 60 * time.Second
+// defaultOfflineRetryInterval is the fallback polling interval used when the
+// channel is offline and no custom value was provided via config.
+const defaultOfflineRetryInterval = 60 * time.Second
 
 // YouTubeProvider polls YouTube Live Chat via the Data API v3.
 // A valid API key is required (free tier: 10 000 quota units/day).
 // YouTube does not offer a WebSocket interface — polling is the only approach.
 //
 // The channel handle (e.g. "@mkbhd" or "mkbhd") is resolved to a channel ID
-// at startup. When the channel is not live the provider polls every minute
+// at startup. When the channel is not live the provider polls every offlineRetry
 // until a live stream starts, then attaches to its chat automatically.
 type YouTubeProvider struct {
-	apiKey  string
-	channel string
+	apiKey        string
+	channel       string
+	offlineRetry  time.Duration
 }
 
 // NewYouTubeProvider creates a YouTubeProvider for the given channel handle.
 // The handle may optionally include the '@' prefix (both "@mkbhd" and "mkbhd" work).
-func NewYouTubeProvider(apiKey string, channel string) *YouTubeProvider {
-	return &YouTubeProvider{apiKey: apiKey, channel: channel}
+// offlineRetry controls how often the provider checks for a live stream; pass 0
+// to use the default (60 s).
+func NewYouTubeProvider(apiKey string, channel string, offlineRetry time.Duration) *YouTubeProvider {
+	if offlineRetry <= 0 {
+		offlineRetry = defaultOfflineRetryInterval
+	}
+	return &YouTubeProvider{apiKey: apiKey, channel: channel, offlineRetry: offlineRetry}
 }
 
 func (p *YouTubeProvider) Name() domain.Platform {
@@ -48,17 +58,17 @@ func (p *YouTubeProvider) Connect(ctx context.Context, out chan<- domain.ChatMes
 		return fmt.Errorf("youtube: create service: %w", err)
 	}
 
-	return pollChannel(ctx, svc, p.channel, out)
+	return pollChannel(ctx, svc, p.channel, p.offlineRetry, out)
 }
 
 // pollChannel resolves the channel ID once, then loops forever:
-//  1. Waits for an active live broadcast (polling every offlineRetryInterval).
+//  1. Waits for an active live broadcast (polling every offlineRetry).
 //  2. Polls the live chat until the stream ends or an error occurs.
 //  3. Goes back to step 1 to catch the next stream.
 //
 // Only returns on ctx cancellation or a fatal error (e.g. invalid API key,
 // channel not found).
-func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, out chan<- domain.ChatMessage) error {
+func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, offlineRetry time.Duration, out chan<- domain.ChatMessage) error {
 	channelID, err := resolveYouTubeChannelID(ctx, svc, channelName)
 	if err != nil {
 		// Fatal: channel doesn't exist or API key is bad — no point retrying.
@@ -71,38 +81,41 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 			return nil
 		}
 
-		// ── Wait for channel to go live ──────────────────────────────────
-		videoID, err := findActiveLiveBroadcast(ctx, svc, channelID)
+		// ── Step 1: RSS pre-check (0 quota units) ────────────────────────────
+		// The channel Atom feed is public and free. We pull the latest video IDs
+		// and check them with one videos.list call (1 unit) for an active chat.
+		// search.list (100 units) is only used as a fallback if the RSS check fails.
+		videoID, liveChatID, err := findLiveBroadcastViaRSS(ctx, svc, channelID)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetryInterval)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(offlineRetryInterval):
+			// Fall back to search.list (100 units) when RSS yields nothing.
+			log.Printf("[youtube] RSS check for %q: %v — falling back to search.list", channelName, err)
+			videoID, err = findActiveLiveBroadcast(ctx, svc, channelID)
+			if err != nil {
+				log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(offlineRetry):
+				}
+				continue
 			}
-			continue
+			liveChatID, err = getLiveChatID(ctx, svc, videoID)
+			if err != nil {
+				log.Printf("[youtube] could not get live chat for %q: %v — retrying in %s", channelName, err, offlineRetry)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(offlineRetry):
+				}
+				continue
+			}
 		}
-		log.Printf("[youtube] channel %q is live: video %s", channelName, videoID)
+		log.Printf("[youtube] channel %q is live: video %s, chat %s", channelName, videoID, liveChatID)
 
-		liveChatID, err := getLiveChatID(ctx, svc, videoID)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			log.Printf("[youtube] could not get live chat for %q: %v — retrying", channelName, err)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(offlineRetryInterval):
-			}
-			continue
-		}
-		log.Printf("[youtube] channel %q live chat ID: %s", channelName, liveChatID)
-
-		// ── Poll chat until stream ends ───────────────────────────────────
+		// ── Step 2: poll chat until stream ends ───────────────────────────────
 		if err := pollLiveChat(ctx, svc, liveChatID, channelName, channelID, out); err != nil && ctx.Err() == nil {
 			log.Printf("[youtube] chat ended for %q (%v) — watching for next stream", channelName, err)
 		}
@@ -135,7 +148,65 @@ func resolveYouTubeChannelID(ctx context.Context, svc *youtube.Service, name str
 	return resp.Items[0].Id, nil
 }
 
+// findLiveBroadcastViaRSS finds an active live stream using the channel's public Atom
+// feed (zero API quota cost) followed by a single videos.list call (1 quota unit).
+// It returns the video ID and active live chat ID, or a non-nil error when the channel
+// is offline or the feed is temporarily unavailable.
+func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelID string) (videoID, liveChatID string, err error) {
+	feedURL := "https://www.youtube.com/feeds/videos.xml?channel_id=" + url.QueryEscape(channelID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
+	if err != nil {
+		return "", "", fmt.Errorf("build RSS request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("fetch RSS: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("RSS feed returned HTTP %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "", "", fmt.Errorf("read RSS body: %w", err)
+	}
+
+	re := regexp.MustCompile(`<yt:videoId>([^<]+)</yt:videoId>`)
+	matches := re.FindAllSubmatch(body, 10)
+	if len(matches) == 0 {
+		return "", "", fmt.Errorf("no videos in RSS feed for channel %s", channelID)
+	}
+
+	ids := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if len(m) > 1 {
+			ids = append(ids, string(m[1]))
+		}
+	}
+
+	// Check the latest videos (up to 5) in one videos.list call — 1 quota unit.
+	if len(ids) > 5 {
+		ids = ids[:5]
+	}
+	vResp, err := svc.Videos.
+		List([]string{"id", "liveStreamingDetails"}).
+		Id(strings.Join(ids, ",")).
+		Context(ctx).
+		Do()
+	if err != nil {
+		return "", "", fmt.Errorf("videos.list: %w", err)
+	}
+	for _, item := range vResp.Items {
+		if item.LiveStreamingDetails != nil && item.LiveStreamingDetails.ActiveLiveChatId != "" {
+			return item.Id, item.LiveStreamingDetails.ActiveLiveChatId, nil
+		}
+	}
+	return "", "", fmt.Errorf("no active live stream in recent videos for channel %s", channelID)
+}
+
 // findActiveLiveBroadcast searches for a currently live video on the given channel.
+// Costs 100 quota units — used only as a fallback when the RSS check fails.
 func findActiveLiveBroadcast(ctx context.Context, svc *youtube.Service, channelID string) (string, error) {
 	resp, err := svc.Search.
 		List([]string{"id"}).
