@@ -85,55 +85,90 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 	// API cache clears and a different (genuinely live) video appears.
 	var skipVideoID string
 
+	// lastSearchCheck tracks the last time we ran a search.list (100 units).
+	// RSS propagation can delay a newly-started stream by 1–5 minutes, so we
+	// run a periodic search.list as a safety net even when RSS says "not live".
+	// Firing every 15 minutes costs at most ~9,600 units/day (under the 10k limit).
+	const periodicSearchInterval = 15 * time.Minute
+	var lastSearchCheck time.Time // zero value means "never checked"
+
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		// ── Step 1: RSS pre-check (0 quota units) ────────────────────────────
+		// ── Step 1: RSS pre-check (0+1 quota units) ──────────────────────────
 		// The channel Atom feed is public and free. We pull the latest video IDs
 		// and check them with one videos.list call (1 unit) for an active chat.
-		// search.list (100 units) is used ONLY when the RSS feed itself is broken.
 		videoID, liveChatID, err := findLiveBroadcastViaRSS(ctx, svc, channelID, skipVideoID)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			if err == errNotLive {
-				// RSS confirmed the channel is offline — no fallback needed.
-				log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(offlineRetry):
+				// ── Step 1b: periodic search.list safety net (100 units) ─────
+				// RSS doesn't always surface a newly-started stream immediately
+				// (propagation delay). Run search.list every 15 minutes so we
+				// catch streams that aren't in the RSS feed yet.
+				now := time.Now()
+				if now.Sub(lastSearchCheck) >= periodicSearchInterval {
+					lastSearchCheck = now
+					log.Printf("[youtube] %q RSS says not live — running periodic search.list safety check (last checked: %s ago)",
+						channelName, formatDuration(now.Sub(lastSearchCheck)))
+					vid, searchErr := findActiveLiveBroadcast(ctx, svc, channelID)
+					if searchErr == nil {
+						log.Printf("[youtube] search.list found live video %q for %q — was missing from RSS", vid, channelName)
+						chatID, chatErr := getLiveChatID(ctx, svc, vid)
+						if chatErr == nil {
+							videoID = vid
+							liveChatID = chatID
+							err = nil // fall through to polling below
+						} else {
+							log.Printf("[youtube] could not get live chat for %q (%v) — retrying in %s", channelName, chatErr, offlineRetry)
+						}
+					} else {
+						log.Printf("[youtube] search.list confirms %q is not live (%v)", channelName, searchErr)
+					}
 				}
-				continue
-			}
-			// RSS feed itself failed (network/HTTP error) — fall back to search.list (100 units).
-			log.Printf("[youtube] RSS unavailable for %q (%v) — falling back to search.list", channelName, err)
-			videoID, err = findActiveLiveBroadcast(ctx, svc, channelID)
-			if err != nil {
-				log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(offlineRetry):
+
+				if err == errNotLive {
+					log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(offlineRetry):
+					}
+					continue
 				}
-				continue
-			}
-			liveChatID, err = getLiveChatID(ctx, svc, videoID)
-			if err != nil {
-				log.Printf("[youtube] could not get live chat for %q: %v — retrying in %s", channelName, err, offlineRetry)
-				select {
-				case <-ctx.Done():
-					return nil
-				case <-time.After(offlineRetry):
+			} else {
+				// RSS feed itself failed (network/HTTP error) — fall back to search.list immediately.
+				log.Printf("[youtube] RSS unavailable for %q (%v) — falling back to search.list", channelName, err)
+				lastSearchCheck = time.Now()
+				videoID, err = findActiveLiveBroadcast(ctx, svc, channelID)
+				if err != nil {
+					log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(offlineRetry):
+					}
+					continue
 				}
-				continue
+				liveChatID, err = getLiveChatID(ctx, svc, videoID)
+				if err != nil {
+					log.Printf("[youtube] could not get live chat for %q: %v — retrying in %s", channelName, err, offlineRetry)
+					select {
+					case <-ctx.Done():
+						return nil
+					case <-time.After(offlineRetry):
+					}
+					continue
+				}
 			}
 		}
 		log.Printf("[youtube] channel %q is live: video %s, chat %s", channelName, videoID, liveChatID)
 		skipVideoID = "" // clear: we have a confirmed new stream
+		lastSearchCheck = time.Time{} // reset so next offline period starts fresh
 
 		// ── Step 2: poll chat until stream ends ───────────────────────────────
 		if err := pollLiveChat(ctx, svc, liveChatID, channelName, channelID, out); err != nil && ctx.Err() == nil {
@@ -142,6 +177,15 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 		// Mark this video as dead so stale API cache doesn't re-detect it as live.
 		skipVideoID = videoID
 	}
+}
+
+// formatDuration formats a duration as a human-readable string (e.g. "2m30s").
+// Returns "never" for zero values to make log messages clearer.
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "never"
+	}
+	return d.Truncate(time.Second).String()
 }
 
 // resolveYouTubeChannelID converts a channel handle (e.g. "@mkbhd" or "mkbhd") or
