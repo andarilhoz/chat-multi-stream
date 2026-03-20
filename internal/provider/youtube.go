@@ -222,6 +222,25 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 	if err != nil {
 		return "", "", fmt.Errorf("videos.list: %w", err)
 	}
+
+	// Build a set of IDs that videos.list actually returned.
+	// YouTube silently omits videos that are very new (not yet indexed),
+	// members-only, or otherwise inaccessible with a public API key.
+	// A missing ID is suspicious — the channel may actually be live.
+	returnedIDs := make(map[string]struct{}, len(vResp.Items))
+	for _, item := range vResp.Items {
+		returnedIDs[item.Id] = struct{}{}
+	}
+	for _, id := range ids {
+		if id == skipVideoID {
+			continue // already known-dead, absence is expected
+		}
+		if _, found := returnedIDs[id]; !found {
+			log.Printf("[youtube/rss] video %s: NOT returned by videos.list (new/unindexed or members-only) — falling back to search.list", id)
+			return "", "", fmt.Errorf("video %s missing from videos.list response", id)
+		}
+	}
+
 	for _, item := range vResp.Items {
 		if item.Id == skipVideoID {
 			log.Printf("[youtube/rss] video %s: SKIPPED (was last dead stream)", item.Id)
@@ -241,7 +260,7 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 			return item.Id, d.ActiveLiveChatId, nil
 		}
 	}
-	// Feed was reachable and videos were checked — channel is simply not live.
+	// Feed was reachable and all video IDs were accounted for — channel is simply not live.
 	log.Printf("[youtube/rss] channel %s: no active live stream found → errNotLive", channelID)
 	return "", "", errNotLive
 }
