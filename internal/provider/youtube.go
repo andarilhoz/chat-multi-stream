@@ -384,6 +384,12 @@ func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channel
 			text := item.Snippet.DisplayMessage
 			if item.Snippet.Type == "textMessageEvent" && item.Snippet.TextMessageDetails != nil {
 				text = item.Snippet.TextMessageDetails.MessageText
+				// Debug: log first few chars to see if shortcodes are present
+				preview := text
+				if len(preview) > 120 {
+					preview = preview[:120] + "…"
+				}
+				log.Printf("[youtube/msg] raw=%q display=%q", preview, item.Snippet.DisplayMessage)
 			}
 
 			select {

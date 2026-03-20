@@ -126,21 +126,25 @@
       // YouTube's public emoji catalog. Each entry looks like:
       // { "id": "00ae", "sc": [":shortcode:", ...], ... }
       // Images are served at: https://www.gstatic.com/youtube/img/emojis/emoji_<id>_48.png
+      const catalogURL = 'https://www.gstatic.com/youtube/img/emojis/v2/emoji_list.json';
       try {
-        const list = await fetch('https://www.gstatic.com/youtube/img/emojis/v2/emoji_list.json').then(r => {
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          return r.json();
-        });
-        for (const entry of list) {
-          if (!entry.id || !Array.isArray(entry.sc)) continue;
-          const url = `https://www.gstatic.com/youtube/img/emojis/emoji_${entry.id}_48.png`;
-          for (const sc of entry.sc) {
-            // Strip surrounding colons: ":face-red-droopy-eyes:" → "face-red-droopy-eyes"
-            const name = sc.replace(/^:|:$/g, '');
-            if (name) ytEmotes[name] = url;
+        const resp = await fetch(catalogURL);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${catalogURL}`);
+        const list = await resp.json();
+        if (!Array.isArray(list)) {
+          console.warn('[overlay] YouTube emoji catalog: unexpected format (not an array), got:', typeof list, list);
+        } else {
+          for (const entry of list) {
+            if (!entry.id || !Array.isArray(entry.sc)) continue;
+            const url = `https://www.gstatic.com/youtube/img/emojis/emoji_${entry.id}_48.png`;
+            for (const sc of entry.sc) {
+              const name = sc.replace(/^:|:$/g, '');
+              if (name) ytEmotes[name] = url;
+            }
           }
+          const keys = Object.keys(ytEmotes);
+          console.log('[overlay] YouTube emotes loaded:', keys.length, '— sample keys:', keys.slice(0, 5));
         }
-        console.log('[overlay] YouTube emotes loaded:', Object.keys(ytEmotes).length);
       } catch (err) {
         console.warn('[overlay] YouTube emoji catalog failed, will use fallback only:', err);
       }
