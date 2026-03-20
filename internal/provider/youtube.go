@@ -197,6 +197,7 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 	re := regexp.MustCompile(`<yt:videoId>([^<]+)</yt:videoId>`)
 	matches := re.FindAllSubmatch(body, 10)
 	if len(matches) == 0 {
+		log.Printf("[youtube/rss] channel %s: RSS feed had no video entries", channelID)
 		return "", "", fmt.Errorf("no videos in RSS feed for channel %s", channelID)
 	}
 
@@ -211,6 +212,8 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 	if len(ids) > 5 {
 		ids = ids[:5]
 	}
+	log.Printf("[youtube/rss] channel %s: RSS videos=%v skipVideoID=%q", channelID, ids, skipVideoID)
+
 	vResp, err := svc.Videos.
 		List([]string{"id", "liveStreamingDetails"}).
 		Id(strings.Join(ids, ",")).
@@ -220,20 +223,25 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 		return "", "", fmt.Errorf("videos.list: %w", err)
 	}
 	for _, item := range vResp.Items {
-		// Skip the video that was most recently polled — YouTube's API can keep
-		// ActiveLiveChatId populated for minutes after a stream ends, so we
-		// ignore it until the loop finds a genuinely different live video.
 		if item.Id == skipVideoID {
+			log.Printf("[youtube/rss] video %s: SKIPPED (was last dead stream)", item.Id)
 			continue
 		}
 		d := item.LiveStreamingDetails
+		if d == nil {
+			log.Printf("[youtube/rss] video %s: no liveStreamingDetails", item.Id)
+			continue
+		}
+		log.Printf("[youtube/rss] video %s: activeLiveChatId=%q actualStartTime=%q actualEndTime=%q",
+			item.Id, d.ActiveLiveChatId, d.ActualStartTime, d.ActualEndTime)
 		// ActualEndTime is set once the broadcast has concluded; an active stream
 		// has an empty ActualEndTime and a non-empty ActiveLiveChatId.
-		if d != nil && d.ActiveLiveChatId != "" && d.ActualEndTime == "" {
+		if d.ActiveLiveChatId != "" && d.ActualEndTime == "" {
 			return item.Id, d.ActiveLiveChatId, nil
 		}
 	}
 	// Feed was reachable and videos were checked — channel is simply not live.
+	log.Printf("[youtube/rss] channel %s: no active live stream found → errNotLive", channelID)
 	return "", "", errNotLive
 }
 
