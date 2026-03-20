@@ -44,9 +44,6 @@
     }
 
     /* Username colour is set inline via style= per platform */
-    .nick {
-      /* color set per-message */
-    }
 
     .colon {
       margin-right: 5px;
@@ -55,6 +52,21 @@
     /* Message text inherits colour (white) from container */
     .message {
       display: inline;
+    }
+
+    /* ── Emote images ── */
+    .emote {
+      height: 28px;
+      width: auto;
+      vertical-align: middle;
+      display: inline-block;
+    }
+
+    /* Fallback badge for YouTube custom emoji not yet in the catalog */
+    .yt-emote-badge {
+      font-size: 0.8em;
+      opacity: 0.7;
+      font-style: italic;
     }
 
     /* ── Fade-out animation ── */
@@ -86,26 +98,200 @@
     // Apply font size override.
     document.getElementById('chat_container').style.fontSize = FONT_SIZE + 'px';
 
-    // ── XSS-safe text escaping ────────────────────────────────────────────
+    // ── XSS-safe helpers ─────────────────────────────────────────────────
     function escapeHTML(str) {
       const el = document.createElement('div');
       el.textContent = str;
       return el.innerHTML;
     }
+    function escapeAttr(str) {
+      return String(str).replace(/[&"<>]/g, c => ({'&':'&amp;','"':'&quot;','<':'&lt;','>':'&gt;'}[c]));
+    }
+    function emoteImg(url, name) {
+      return `<img src="${escapeAttr(url)}" alt="${escapeHTML(name)}" class="emote" loading="lazy">`;
+    }
+
+    // ── Third-party emote registries ──────────────────────────────────────
+    // Keyed by emote name → CDN URL.
+    const globalEmotes  = {};           // BTTV / FFZ / 7TV globals
+    const channelEmotes = {};           // channelId → { name → url }
+    const loadingChannels = new Set();  // channel IDs currently being fetched
+
+    // ── YouTube emoji shortcode map ───────────────────────────────────────
+    // Populated from the YouTube emoji catalog (gstatic CDN) at startup.
+    // Keys are shortcodes without the surrounding colons, e.g. "face-red-droopy-eyes".
+    const ytEmotes = {};
+
+    async function loadYouTubeEmotes() {
+      // YouTube's public emoji catalog. Each entry looks like:
+      // { "id": "00ae", "sc": [":shortcode:", ...], ... }
+      // Images are served at: https://www.gstatic.com/youtube/img/emojis/emoji_<id>_48.png
+      try {
+        const list = await fetch('https://www.gstatic.com/youtube/img/emojis/v2/emoji_list.json').then(r => {
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          return r.json();
+        });
+        for (const entry of list) {
+          if (!entry.id || !Array.isArray(entry.sc)) continue;
+          const url = `https://www.gstatic.com/youtube/img/emojis/emoji_${entry.id}_48.png`;
+          for (const sc of entry.sc) {
+            // Strip surrounding colons: ":face-red-droopy-eyes:" → "face-red-droopy-eyes"
+            const name = sc.replace(/^:|:$/g, '');
+            if (name) ytEmotes[name] = url;
+          }
+        }
+        console.log('[overlay] YouTube emotes loaded:', Object.keys(ytEmotes).length);
+      } catch (err) {
+        console.warn('[overlay] YouTube emoji catalog failed, will use fallback only:', err);
+      }
+    }
+
+    async function loadGlobalEmotes() {
+      // BTTV global
+      try {
+        const list = await fetch('https://api.betterttv.net/3/cached/emotes/global').then(r => r.json());
+        for (const e of list) {
+          globalEmotes[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+        }
+      } catch (err) { console.warn('[overlay] BTTV global failed', err); }
+
+      // FFZ global
+      try {
+        const data = await fetch('https://api.frankerfacez.com/v1/set/global').then(r => r.json());
+        for (const setId of (data.default_sets || [])) {
+          const set = data.sets?.[String(setId)];
+          if (!set) continue;
+          for (const em of set.emoticons) {
+            const raw = em.urls?.['2'] || em.urls?.['1'];
+            if (raw) globalEmotes[em.name] = raw.startsWith('//') ? 'https:' + raw : raw;
+          }
+        }
+      } catch (err) { console.warn('[overlay] FFZ global failed', err); }
+
+      // 7TV global
+      try {
+        const data = await fetch('https://7tv.io/v3/emote-sets/global').then(r => r.json());
+        for (const e of (data.emotes || [])) {
+          const host = e.data?.host;
+          if (!host) continue;
+          const file = host.files?.find(f => f.name === '2x.webp') || host.files?.[0];
+          if (file) globalEmotes[e.name] = `https:${host.url}/${file.name}`;
+        }
+      } catch (err) { console.warn('[overlay] 7TV global failed', err); }
+
+      console.log('[overlay] global emotes loaded:', Object.keys(globalEmotes).length);
+    }
+
+    // Lazily load channel-specific emotes the first time we see a channel_id.
+    async function loadChannelEmotes(channelId, channelName) {
+      if (channelEmotes[channelId] !== undefined || loadingChannels.has(channelId)) return;
+      loadingChannels.add(channelId);
+      const map = {};
+
+      // BTTV channel
+      try {
+        const data = await fetch(`https://api.betterttv.net/3/cached/users/twitch/${encodeURIComponent(channelId)}`).then(r => r.json());
+        for (const e of [...(data.channelEmotes || []), ...(data.sharedEmotes || [])]) {
+          map[e.code] = `https://cdn.betterttv.net/emote/${e.id}/2x`;
+        }
+      } catch (err) { console.warn('[overlay] BTTV channel failed', err); }
+
+      // FFZ channel (accepts channel name directly)
+      try {
+        const data = await fetch(`https://api.frankerfacez.com/v1/room/${encodeURIComponent(channelName)}`).then(r => r.json());
+        const set = data.sets?.[String(data.room?.set)];
+        if (set) {
+          for (const em of set.emoticons) {
+            const raw = em.urls?.['2'] || em.urls?.['1'];
+            if (raw) map[em.name] = raw.startsWith('//') ? 'https:' + raw : raw;
+          }
+        }
+      } catch (err) { console.warn('[overlay] FFZ channel failed', err); }
+
+      // 7TV channel
+      try {
+        const data = await fetch(`https://7tv.io/v3/users/twitch/${encodeURIComponent(channelId)}`).then(r => r.json());
+        for (const e of (data.emote_set?.emotes || [])) {
+          const host = e.data?.host;
+          if (!host) continue;
+          const file = host.files?.find(f => f.name === '2x.webp') || host.files?.[0];
+          if (file) map[e.name] = `https:${host.url}/${file.name}`;
+        }
+      } catch (err) { console.warn('[overlay] 7TV channel failed', err); }
+
+      channelEmotes[channelId] = map;
+      console.log(`[overlay] channel ${channelName} (${channelId}) emotes loaded:`, Object.keys(map).length);
+    }
+
+    // ── Message HTML renderer ─────────────────────────────────────────────
+    // Builds safe HTML for a message, replacing known emote names with <img>.
+    function renderMessageHTML(msg) {
+      // Merge: YouTube catalog → global third-party → channel-specific → backend-provided (highest priority)
+      const emoteMap = Object.assign({}, ytEmotes, globalEmotes);
+      if (msg.channel_id && channelEmotes[msg.channel_id]) {
+        Object.assign(emoteMap, channelEmotes[msg.channel_id]);
+      }
+      if (Array.isArray(msg.emotes)) {
+        for (const e of msg.emotes) emoteMap[e.name] = e.url;
+      }
+
+      function renderWord(word) {
+        return emoteMap[word] ? emoteImg(emoteMap[word], word) : escapeHTML(word);
+      }
+
+      if (msg.platform === 'youtube') {
+        // YouTube encodes custom emoji as :shortcode: in the message text.
+        // Standard Unicode emoji (🎉, 😂) are returned as-is and rendered natively.
+        return msg.message.split(/(:[-\w]+:)/).map(part => {
+          const m = part.match(/^:([-\w]+):$/);
+          if (m) {
+            const name = m[1];
+            if (emoteMap[name]) return emoteImg(emoteMap[name], name);
+            // Unrecognised YouTube shortcode: show as a muted inline badge.
+            return `<span class="yt-emote-badge">${escapeHTML(part)}</span>`;
+          }
+          return escapeHTML(part);
+        }).join('');
+      }
+
+      if (msg.platform === 'kick') {
+        // Kick embeds emotes as [emote:NUMERIC_ID:name] inside the message text.
+        // Split on those tokens, render each separately.
+        const parts = msg.message.split(/(\[emote:\d+:[^\]]*\])/);
+        return parts.map(part => {
+          const m = part.match(/^\[emote:(\d+):([^\]]*)\]$/);
+          if (m) {
+            const [, id, name] = m;
+            return emoteImg(`https://files.kick.com/emotes/${id}/fullsize`, name || id);
+          }
+          // Plain text portion — still do word-based emote matching.
+          return part.split(' ').map(renderWord).join(' ');
+        }).join('');
+      }
+
+      // All other platforms: word-by-word matching.
+      return msg.message.split(' ').map(renderWord).join(' ');
+    }
 
     // ── Render a message ─────────────────────────────────────────────────
     function addMessage(msg) {
-      const chat = document.getElementById('chat_container');
+      // Kick and Twitch channel emotes are loaded lazily on first message.
+      if (msg.channel_id) {
+        loadChannelEmotes(msg.channel_id, msg.channel);
+      }
+
+      const chat  = document.getElementById('chat_container');
       const color = PLATFORM_COLORS[msg.platform] || '#ffffff';
 
       const line = document.createElement('div');
       line.className = 'chat_line';
+      // renderMessageHTML produces safe HTML; username/color go through escape helpers.
       line.innerHTML =
         `<span class="user_info">` +
-          `<span class="nick" style="color:${escapeHTML(color)}">${escapeHTML(msg.username)}</span>` +
+          `<span class="nick" style="color:${escapeAttr(color)}">${escapeHTML(msg.username)}</span>` +
           `<span class="colon">:</span>` +
         `</span>` +
-        `<span class="message">${escapeHTML(msg.message)}</span>`;
+        `<span class="message"> ${renderMessageHTML(msg)}</span>`;
 
       chat.appendChild(line);
 
@@ -139,7 +325,8 @@
       };
     }
 
-    connect();
+    // Load all emote catalogs in the background, then open the WebSocket.
+    Promise.all([loadYouTubeEmotes(), loadGlobalEmotes()]).finally(connect);
   </script>
 </body>
 </html>

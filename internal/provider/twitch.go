@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	irc "github.com/gempir/go-twitch-irc/v4"
@@ -14,6 +16,9 @@ import (
 // The IRC connection works regardless of whether the streamer is currently live.
 type TwitchProvider struct {
 	channel string
+	// roomIDs caches the numeric Twitch room-id for each channel name so it can
+	// be included in outgoing messages for BTTV / FFZ / 7TV lookups on the frontend.
+	roomIDs sync.Map // string → string
 }
 
 // NewTwitchProvider creates a TwitchProvider for the given channel name.
@@ -30,18 +35,51 @@ func (p *TwitchProvider) Name() domain.Platform {
 func (p *TwitchProvider) Connect(ctx context.Context, out chan<- domain.ChatMessage) error {
 	client := irc.NewAnonymousClient()
 
+	// Cache the room-id from ROOMSTATE so we can attach it to every message.
+	client.OnRoomStateMessage(func(msg irc.RoomStateMessage) {
+		if msg.RoomID != "" {
+			p.roomIDs.Store(msg.Channel, msg.RoomID)
+		}
+	})
+
 	client.OnPrivateMessage(func(msg irc.PrivateMessage) {
 		ts := msg.Time
 		if ts.IsZero() {
 			ts = time.Now()
 		}
+
+		// Deduplicate native Twitch emotes and build render URLs.
+		seen := make(map[string]bool, len(msg.Emotes))
+		emotes := make([]domain.EmoteInfo, 0, len(msg.Emotes))
+		for _, e := range msg.Emotes {
+			if !seen[e.Name] {
+				seen[e.Name] = true
+				emotes = append(emotes, domain.EmoteInfo{
+					Name: e.Name,
+					URL:  fmt.Sprintf("https://static-cdn.jtvnw.net/emoticons/v2/%s/default/dark/2.0", e.ID),
+				})
+			}
+		}
+
+		// Prefer the room-id from ROOMSTATE; fall back to the tag on the message itself.
+		channelID := msg.RoomID
+		if channelID == "" {
+			if id, ok := p.roomIDs.Load(msg.Channel); ok {
+				channelID = id.(string)
+			}
+		} else {
+			p.roomIDs.Store(msg.Channel, channelID)
+		}
+
 		select {
 		case <-ctx.Done():
 		case out <- domain.ChatMessage{
 			Platform:  domain.PlatformTwitch,
 			Channel:   msg.Channel,
+			ChannelID: channelID,
 			Username:  msg.User.DisplayName,
 			Message:   msg.Message,
+			Emotes:    emotes,
 			Timestamp: ts,
 		}:
 		}

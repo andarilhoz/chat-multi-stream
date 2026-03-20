@@ -103,7 +103,7 @@ func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, 
 		log.Printf("[youtube] channel %q live chat ID: %s", channelName, liveChatID)
 
 		// ── Poll chat until stream ends ───────────────────────────────────
-		if err := pollLiveChat(ctx, svc, liveChatID, channelName, out); err != nil && ctx.Err() == nil {
+		if err := pollLiveChat(ctx, svc, liveChatID, channelName, channelID, out); err != nil && ctx.Err() == nil {
 			log.Printf("[youtube] chat ended for %q (%v) — watching for next stream", channelName, err)
 		}
 	}
@@ -175,7 +175,9 @@ func getLiveChatID(ctx context.Context, svc *youtube.Service, videoID string) (s
 
 // pollLiveChat polls a live chat for new messages, forwarding each one to out.
 // It respects the pollingIntervalMillis from each API response to avoid quota exhaustion.
-func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channelName string, out chan<- domain.ChatMessage) error {
+// channelID is the resolved YouTube channel ID and is attached to every message so the
+// frontend can perform channel-scoped emoji lookups.
+func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channelName, channelID string, out chan<- domain.ChatMessage) error {
 	var pageToken string
 	for {
 		if ctx.Err() != nil {
@@ -199,14 +201,25 @@ func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channel
 			if err != nil {
 				ts = time.Now()
 			}
+
+			// For text messages use the raw message field so emoji shortcodes
+			// are preserved exactly as the user typed them. For all other event
+			// types (superChatEvent, memberMilestoneChatEvent, etc.) fall back
+			// to DisplayMessage which already contains a human-readable summary.
+			text := item.Snippet.DisplayMessage
+			if item.Snippet.Type == "textMessageEvent" && item.Snippet.TextMessageDetails != nil {
+				text = item.Snippet.TextMessageDetails.MessageText
+			}
+
 			select {
 			case <-ctx.Done():
 				return nil
 			case out <- domain.ChatMessage{
 				Platform:  domain.PlatformYouTube,
 				Channel:   channelName,
-				Username:  item.AuthorDetails.DisplayName,
-				Message:   item.Snippet.DisplayMessage,
+				ChannelID: channelID,
+				Username:  strings.TrimPrefix(item.AuthorDetails.DisplayName, "@"),
+				Message:   text,
 				Timestamp: ts,
 			}:
 			}
