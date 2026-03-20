@@ -234,9 +234,10 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 		}
 		log.Printf("[youtube/rss] video %s: activeLiveChatId=%q actualStartTime=%q actualEndTime=%q",
 			item.Id, d.ActiveLiveChatId, d.ActualStartTime, d.ActualEndTime)
-		// ActualEndTime is set once the broadcast has concluded; an active stream
-		// has an empty ActualEndTime and a non-empty ActiveLiveChatId.
-		if d.ActiveLiveChatId != "" && d.ActualEndTime == "" {
+		// A truly live stream has: chat ID set, stream has started (ActualStartTime != ""),
+		// and stream has not ended (ActualEndTime == "").
+		// Upcoming/scheduled streams also have a chat ID but ActualStartTime is empty — skip those.
+		if d.ActiveLiveChatId != "" && d.ActualStartTime != "" && d.ActualEndTime == "" {
 			return item.Id, d.ActiveLiveChatId, nil
 		}
 	}
