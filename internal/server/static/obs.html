@@ -154,14 +154,26 @@
 
     // Badge display config: badge key → { label, color }
     const BADGE_CONFIG = {
-      broadcaster: { label: 'HOST', color: '#f59e0b' },
-      owner:       { label: 'HOST', color: '#f59e0b' },
-      moderator:   { label: 'MOD',  color: '#22c55e' },
-      mod:         { label: 'MOD',  color: '#22c55e' },
-      vip:         { label: 'VIP',  color: '#ec4899' },
-      subscriber:  { label: 'SUB',  color: '#a855f7' },
-      member:      { label: 'MEM',  color: '#a855f7' },
-      staff:       { label: 'STAFF', color: '#3b82f6' },
+      // Channel roles
+      broadcaster: { label: 'HOST',   color: '#f59e0b' },
+      owner:       { label: 'HOST',   color: '#f59e0b' },
+      moderator:   { label: 'MOD',    color: '#22c55e' },
+      mod:         { label: 'MOD',    color: '#22c55e' },
+      global_mod:  { label: 'GMOD',   color: '#22c55e' },
+      admin:       { label: 'ADMIN',  color: '#e84393' },
+      staff:       { label: 'STAFF',  color: '#3b82f6' },
+      vip:         { label: 'VIP',    color: '#ec4899' },
+      partner:     { label: 'PAR',    color: '#9147ff' },
+      verified:    { label: 'VER',    color: '#3b82f6' },
+      og:          { label: 'OG',     color: '#f59e0b' },
+      // Subscription tiers
+      subscriber:  { label: 'SUB',    color: '#a855f7' },
+      member:      { label: 'MEM',    color: '#a855f7' },
+      founder:     { label: 'FNDR',   color: '#a855f7' },
+      premium:     { label: 'PREM',   color: '#009cdc' }, // Twitch Prime Gaming
+      turbo:       { label: 'TURBO',  color: '#6441a5' },
+      sub_gifter:  { label: 'GIFT',   color: '#a855f7' }, // Kick gift sub
+      'sub-gifter':{ label: 'GIFT',   color: '#a855f7' }, // Twitch gift sub
     };
 
     function renderBadges(badges) {
@@ -357,8 +369,8 @@
       const timeStr = formatTime(msg.timestamp);
       line.innerHTML =
         `<div class="user_info">` +
-          renderBadges(msg.badges) +
           `<span class="nick" style="color:${escapeAttr(color)}">${escapeHTML(msg.username)}</span>` +
+          renderBadges(msg.badges) +
           (timeStr ? `<span class="timestamp">${escapeHTML(timeStr)}</span>` : '') +
         `</div>` +
         `<span class="message">${renderMessageHTML(msg)}</span>`;
