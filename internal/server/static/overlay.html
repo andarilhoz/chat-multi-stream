@@ -118,35 +118,32 @@
     const loadingChannels = new Set();  // channel IDs currently being fetched
 
     // ── YouTube emoji shortcode map ───────────────────────────────────────
-    // Populated from the YouTube emoji catalog (gstatic CDN) at startup.
-    // Keys are shortcodes without the surrounding colons, e.g. "face-red-droopy-eyes".
-    const ytEmotes = {};
+    // Populated lazily per YouTube video ID via our backend proxy endpoint
+    // /api/yt-emojis?videoId=VIDEO_ID, which scrapes ytInitialData from the
+    // YouTube live_chat page. This includes both YouTube standard emoji and
+    // channel membership emoji for the active stream.
+    // Keys are shortcodes without the surrounding colons, e.g. "face-blue-smiling".
+    const ytEmotes = {};                    // legacy global map (kept for compat)
+    const loadingYTVideos = new Set();      // video IDs currently being fetched
 
-    async function loadYouTubeEmotes() {
-      // YouTube's public emoji catalog. Each entry looks like:
-      // { "id": "00ae", "sc": [":shortcode:", ...], ... }
-      // Images are served at: https://www.gstatic.com/youtube/img/emojis/emoji_<id>_48.png
-      const catalogURL = 'https://www.gstatic.com/youtube/img/emojis/v2/emoji_list.json';
+    async function loadYouTubeVideoEmojis(videoId) {
+      if (!videoId || loadingYTVideos.has(videoId)) return;
+      // Already loaded into channelEmotes?
+      if (channelEmotes[videoId] !== undefined) return;
+      loadingYTVideos.add(videoId);
       try {
-        const resp = await fetch(catalogURL);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status} from ${catalogURL}`);
-        const list = await resp.json();
-        if (!Array.isArray(list)) {
-          console.warn('[overlay] YouTube emoji catalog: unexpected format (not an array), got:', typeof list, list);
-        } else {
-          for (const entry of list) {
-            if (!entry.id || !Array.isArray(entry.sc)) continue;
-            const url = `https://www.gstatic.com/youtube/img/emojis/emoji_${entry.id}_48.png`;
-            for (const sc of entry.sc) {
-              const name = sc.replace(/^:|:$/g, '');
-              if (name) ytEmotes[name] = url;
-            }
-          }
-          const keys = Object.keys(ytEmotes);
-          console.log('[overlay] YouTube emotes loaded:', keys.length, '— sample keys:', keys.slice(0, 5));
-        }
+        const resp = await fetch(`/api/yt-emojis?videoId=${encodeURIComponent(videoId)}`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const map = await resp.json();
+        // Merge into channelEmotes so renderMessageHTML picks them up.
+        channelEmotes[videoId] = Object.assign(channelEmotes[videoId] || {}, map);
+        const count = Object.keys(map).length;
+        console.log(`[overlay] YouTube emoji loaded for ${videoId}:`, count);
       } catch (err) {
-        console.warn('[overlay] YouTube emoji catalog failed, will use fallback only:', err);
+        console.warn('[overlay] YouTube emoji fetch failed for', videoId, err);
+        channelEmotes[videoId] = channelEmotes[videoId] || {};
+      } finally {
+        loadingYTVideos.delete(videoId);
       }
     }
 
@@ -279,8 +276,11 @@
 
     // ── Render a message ─────────────────────────────────────────────────
     function addMessage(msg) {
-      // Kick and Twitch channel emotes are loaded lazily on first message.
-      if (msg.channel_id) {
+      if (msg.platform === 'youtube' && msg.channel_id) {
+        // YouTube: load emoji catalog for this specific video/stream.
+        loadYouTubeVideoEmojis(msg.channel_id);
+      } else if (msg.channel_id) {
+        // Twitch / Kick: load BTTV / FFZ / 7TV channel emotes.
         loadChannelEmotes(msg.channel_id, msg.channel);
       }
 
@@ -329,8 +329,9 @@
       };
     }
 
-    // Load all emote catalogs in the background, then open the WebSocket.
-    Promise.all([loadYouTubeEmotes(), loadGlobalEmotes()]).finally(connect);
+    // Load global third-party emote catalogs, then open the WebSocket.
+    // YouTube emoji are loaded lazily per video ID when the first message arrives.
+    loadGlobalEmotes().finally(connect);
   </script>
 </body>
 </html>

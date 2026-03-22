@@ -3,10 +3,14 @@ package server
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
 	_ "embed"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +36,7 @@ type Server struct {
 	adminUser     string
 	adminPassword string
 	ytProvider    *provider.YouTubeProvider
+	ytEmojiCache  sync.Map // videoID → map[string]string
 }
 
 // New creates a Server that reads from messages and broadcasts to all connected
@@ -51,6 +56,7 @@ func New(addr string, messages <-chan domain.ChatMessage, adminUser, adminPasswo
 	mux.HandleFunc("/overlay", s.handleOverlay)
 	mux.HandleFunc("/obs",     s.handleOBS)
 	mux.HandleFunc("/health",  s.handleHealth)
+	mux.HandleFunc("/api/yt-emojis", s.handleYouTubeEmojis)
 
 	if adminUser != "" && adminPassword != "" && ytProvider != nil {
 		mux.HandleFunc("/admin", s.basicAuth(s.handleAdmin))
@@ -245,6 +251,133 @@ func (s *Server) handleAdminToggle(w http.ResponseWriter, r *http.Request) {
 	state := s.ytProvider.GetState()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(state)
+}
+
+// ── YouTube emoji proxy ───────────────────────────────────────────────────────
+
+// ytVideoIDRe validates YouTube video IDs (11 base64url chars, but can also be
+// shorter variants; we allow 6–20 alphanumeric/-/_ chars).
+var ytVideoIDRe = regexp.MustCompile(`^[A-Za-z0-9_\-]{6,20}$`)
+
+// handleYouTubeEmojis fetches the emoji catalog for a YouTube live chat by
+// scraping ytInitialData from the live_chat page. Results are cached per
+// video ID for the lifetime of the server process.
+//
+// GET /api/yt-emojis?videoId=VIDEO_ID
+// Response: {"shortcode": "https://image-url", ...}
+func (s *Server) handleYouTubeEmojis(w http.ResponseWriter, r *http.Request) {
+	videoID := r.URL.Query().Get("videoId")
+	if !ytVideoIDRe.MatchString(videoID) {
+		http.Error(w, "invalid videoId", http.StatusBadRequest)
+		return
+	}
+
+	// Return cached result if available.
+	if v, ok := s.ytEmojiCache.Load(videoID); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "max-age=3600")
+		_ = json.NewEncoder(w).Encode(v)
+		return
+	}
+
+	emojis, err := fetchYTEmojiCatalog(videoID)
+	if err != nil {
+		log.Printf("[yt-emojis] fetch failed for %s: %v", videoID, err)
+		emojis = map[string]string{} // empty — overlay shows fallback badge
+	} else {
+		log.Printf("[yt-emojis] loaded %d emoji for video %s", len(emojis), videoID)
+	}
+	s.ytEmojiCache.Store(videoID, emojis)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "max-age=3600")
+	_ = json.NewEncoder(w).Encode(emojis)
+}
+
+// fetchYTEmojiCatalog scrapes the YouTube live_chat HTML page for the given
+// video ID and extracts the emoji shortcode → thumbnail URL map from the
+// embedded ytInitialData JSON blob.
+func fetchYTEmojiCatalog(videoID string) (map[string]string, error) {
+	url := "https://www.youtube.com/live_chat?v=" + videoID + "&is_popup=1"
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch live_chat page: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024)) // 4 MB cap
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+	html := string(body)
+
+	const marker = `ytInitialData"] = `
+	idx := strings.Index(html, marker)
+	if idx < 0 {
+		return nil, fmt.Errorf("ytInitialData not found (video not live?)")
+	}
+	jsonStart := strings.IndexByte(html[idx:], '{')
+	if jsonStart < 0 {
+		return nil, fmt.Errorf("ytInitialData JSON start not found")
+	}
+
+	// Decode only the fields we need; ignore the rest via RawMessage.
+	type thumbnail struct {
+		URL string `json:"url"`
+	}
+	type emojiEntry struct {
+		EmojiID   string   `json:"emojiId"`
+		Shortcuts []string `json:"shortcuts"`
+		Image     struct {
+			Thumbnails []thumbnail `json:"thumbnails"`
+		} `json:"image"`
+	}
+	var data struct {
+		Contents struct {
+			LiveChatRenderer struct {
+				Emojis []emojiEntry `json:"emojis"`
+			} `json:"liveChatRenderer"`
+		} `json:"contents"`
+	}
+
+	dec := json.NewDecoder(strings.NewReader(html[idx+jsonStart:]))
+	if err := dec.Decode(&data); err != nil {
+		return nil, fmt.Errorf("decode ytInitialData: %w", err)
+	}
+
+	result := make(map[string]string, len(data.Contents.LiveChatRenderer.Emojis))
+	for _, e := range data.Contents.LiveChatRenderer.Emojis {
+		thumbs := e.Image.Thumbnails
+		if len(thumbs) == 0 {
+			continue
+		}
+		// Pick the largest thumbnail (last entry).
+		imgURL := thumbs[len(thumbs)-1].URL
+		// Prefer 48 px size; adjust the size query appended by YouTube.
+		imgURL = strings.TrimRight(imgURL, " ")
+
+		// Map by every shortcode (e.g. ":face-blue-smiling:" → "face-blue-smiling").
+		for _, sc := range e.Shortcuts {
+			name := strings.Trim(sc, ":")
+			if name != "" {
+				result[name] = imgURL
+			}
+		}
+		// Also map by emojiId in case the message uses raw IDs.
+		if e.EmojiID != "" && len(e.Shortcuts) == 0 {
+			result[e.EmojiID] = imgURL
+		}
+	}
+	return result, nil
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
