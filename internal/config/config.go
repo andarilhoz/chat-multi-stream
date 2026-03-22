@@ -19,6 +19,10 @@ type Config struct {
 	// the channel has gone live. Defaults to 60 seconds.
 	YouTubeOfflineRetry     time.Duration
 	KickChannel             string
+	// AdminUser and AdminPassword protect the /admin dashboard with HTTP Basic Auth.
+	// If either is empty the admin routes are not registered.
+	AdminUser               string
+	AdminPassword           string
 }
 
 // Load reads configuration from the environment, loading a .env file if one exists.
@@ -42,6 +46,8 @@ func Load() (*Config, error) {
 		YouTubeChannel:      os.Getenv("YOUTUBE_CHANNEL"),
 		YouTubeOfflineRetry: time.Duration(retrySeconds) * time.Second,
 		KickChannel:         os.Getenv("KICK_CHANNEL"),
+		AdminUser:           os.Getenv("ADMIN_USER"),
+		AdminPassword:       os.Getenv("ADMIN_PASSWORD"),
 	}
 
 	if !cfg.hasAnyProvider() {

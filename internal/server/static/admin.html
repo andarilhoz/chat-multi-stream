@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>chat-multi-stream · admin</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f0f0f;
+      --surface:   #1a1a1a;
+      --border:    #2a2a2a;
+      --text:      #e0e0e0;
+      --muted:     #888;
+      --yt:        #ff4444;
+      --green:     #4caf50;
+      --orange:    #ff9800;
+      --radius:    8px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    h1 {
+      font-size: 20px;
+      font-weight: 600;
+      margin-bottom: 24px;
+      color: var(--yt);
+      letter-spacing: 0.5px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+      max-width: 960px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+    }
+
+    .card h2 {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--muted);
+      margin-bottom: 16px;
+    }
+
+    /* ── Toggle ── */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+
+    .toggle-btn {
+      position: relative;
+      width: 52px;
+      height: 28px;
+      cursor: pointer;
+      background: #333;
+      border: none;
+      border-radius: 14px;
+      transition: background 0.2s;
+      flex-shrink: 0;
+    }
+
+    .toggle-btn.on  { background: var(--green); }
+    .toggle-btn.off { background: #444; }
+
+    .toggle-btn::after {
+      content: '';
+      position: absolute;
+      top: 3px;
+      left: 3px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform 0.2s;
+    }
+
+    .toggle-btn.on::after { transform: translateX(24px); }
+
+    .toggle-label {
+      font-size: 15px;
+      font-weight: 500;
+    }
+
+    /* ── Badges ── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 600;
+      padding: 3px 10px;
+      border-radius: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .badge.live    { background: rgba(255,68,68,0.2);  color: var(--yt);    border: 1px solid rgba(255,68,68,0.4); }
+    .badge.offline { background: rgba(136,136,136,0.15); color: var(--muted); border: 1px solid rgba(136,136,136,0.3); }
+    .badge.enabled { background: rgba(76,175,80,0.15); color: var(--green); border: 1px solid rgba(76,175,80,0.3); }
+    .badge.disabled{ background: rgba(255,152,0,0.15); color: var(--orange); border: 1px solid rgba(255,152,0,0.3); }
+
+    .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .dot.pulse {
+      animation: pulse 1.4s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.3; }
+    }
+
+    /* ── Info rows ── */
+    .info-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .info-row:last-child { border-bottom: none; }
+
+    .info-key {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .info-val {
+      font-size: 13px;
+      font-weight: 500;
+      text-align: right;
+      max-width: 60%;
+      word-break: break-all;
+    }
+
+    .info-val a {
+      color: var(--yt);
+      text-decoration: none;
+    }
+
+    .info-val a:hover { text-decoration: underline; }
+
+    /* ── Quota bar ── */
+    .quota-bar-wrap {
+      margin: 12px 0 16px;
+    }
+
+    .quota-bar-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 5px;
+    }
+
+    .quota-bar {
+      height: 8px;
+      border-radius: 4px;
+      background: var(--border);
+      overflow: hidden;
+    }
+
+    .quota-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: var(--green);
+      transition: width 0.4s ease, background 0.4s ease;
+    }
+
+    .quota-bar-fill.warn   { background: var(--orange); }
+    .quota-bar-fill.danger { background: var(--yt); }
+
+    /* ── Quota table ── */
+    .quota-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+
+    .quota-table th {
+      text-align: left;
+      color: var(--muted);
+      font-weight: 500;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .quota-table th:last-child,
+    .quota-table td:last-child { text-align: right; }
+
+    .quota-table td {
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(42,42,42,0.5);
+      color: var(--text);
+    }
+
+    .quota-table tr:last-child td { border-bottom: none; }
+
+    /* ── Footer ── */
+    .footer {
+      margin-top: 20px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    #last-update { color: var(--text); }
+  </style>
+</head>
+<body>
+  <h1>⚙ chat-multi-stream · admin</h1>
+
+  <div class="grid">
+
+    <!-- Toggle card -->
+    <div class="card">
+      <h2>YouTube Provider</h2>
+      <div class="toggle-row">
+        <button id="toggle-btn" class="toggle-btn" title="Toggle YouTube provider" onclick="doToggle()"></button>
+        <span class="toggle-label" id="toggle-label">Carregando…</span>
+      </div>
+      <p style="margin-top:12px;font-size:12px;color:var(--muted);">
+        Desabilitar pausa a leitura do chat e evita o consumo de quota da API do YouTube.
+        A stream pode ser reativada a qualquer momento sem reiniciar o servidor.
+      </p>
+    </div>
+
+    <!-- Live info card -->
+    <div class="card">
+      <h2>Status da Live</h2>
+      <div class="info-row">
+        <span class="info-key">Canal</span>
+        <span class="info-val" id="channel-name">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Provedor</span>
+        <span class="info-val" id="provider-badge"></span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Live</span>
+        <span class="info-val" id="live-badge"></span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Link da live</span>
+        <span class="info-val" id="video-url">—</span>
+      </div>
+      <div class="info-row">
+        <span class="info-key">Video ID</span>
+        <span class="info-val" id="video-id" style="font-family:monospace;font-size:11px;color:var(--muted)">—</span>
+      </div>
+    </div>
+
+    <!-- Quota card -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Quota da API (sessão atual)</h2>
+      <div class="quota-bar-wrap">
+        <div class="quota-bar-labels">
+          <span id="quota-used-label">0 unidades usadas</span>
+          <span>limite diário: 10 000</span>
+        </div>
+        <div class="quota-bar">
+          <div class="quota-bar-fill" id="quota-bar-fill" style="width:0%"></div>
+        </div>
+      </div>
+
+      <table class="quota-table">
+        <thead>
+          <tr>
+            <th>Tipo de chamada</th>
+            <th>Custo unitário</th>
+            <th>Chamadas</th>
+            <th>Subtotal</th>
+          </tr>
+        </thead>
+        <tbody id="quota-tbody">
+          <tr><td colspan="4" style="color:var(--muted);padding:8px 0">Aguardando dados…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </div>
+
+  <div class="footer">
+    Última atualização: <span id="last-update">—</span> &nbsp;·&nbsp; atualização automática a cada 5 s
+  </div>
+
+  <script>
+    const DAILY_LIMIT = 10000;
+
+    let currentEnabled = true;
+    let updating = false;
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/admin/api/status');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        return await res.json();
+      } catch (e) {
+        console.error('fetchStatus:', e);
+        return null;
+      }
+    }
+
+    function renderStatus(s) {
+      if (!s) return;
+
+      // Toggle button
+      currentEnabled = s.Enabled;
+      const btn = document.getElementById('toggle-btn');
+      btn.className = 'toggle-btn ' + (s.Enabled ? 'on' : 'off');
+      document.getElementById('toggle-label').textContent = s.Enabled ? 'Habilitado' : 'Desabilitado';
+
+      // Channel
+      document.getElementById('channel-name').textContent = s.ChannelName || '—';
+
+      // Provider badge
+      const provBadge = document.getElementById('provider-badge');
+      provBadge.innerHTML = s.Enabled
+        ? '<span class="badge enabled"><span class="dot"></span>Ativo</span>'
+        : '<span class="badge disabled"><span class="dot"></span>Pausado</span>';
+
+      // Live badge
+      const liveBadge = document.getElementById('live-badge');
+      liveBadge.innerHTML = s.IsLive
+        ? '<span class="badge live"><span class="dot pulse"></span>AO VIVO</span>'
+        : '<span class="badge offline"><span class="dot"></span>Offline</span>';
+
+      // Video URL
+      const videoUrlEl = document.getElementById('video-url');
+      if (s.VideoURL) {
+        videoUrlEl.innerHTML = '<a href="' + escapeAttr(s.VideoURL) + '" target="_blank" rel="noopener">Abrir no YouTube ↗</a>';
+      } else {
+        videoUrlEl.textContent = '—';
+      }
+
+      // Video ID
+      document.getElementById('video-id').textContent = s.VideoID || '—';
+
+      // Quota
+      const q = s.Quota || {};
+      const total   = q.Total   || 0;
+      const search  = q.Search  || 0;
+      const chat    = q.Chat    || 0;
+      const video   = q.Video   || 0;
+      const channel = q.Channel || 0;
+
+      document.getElementById('quota-used-label').textContent = total.toLocaleString('pt-BR') + ' unidades usadas';
+
+      const pct = Math.min(100, (total / DAILY_LIMIT) * 100);
+      const fill = document.getElementById('quota-bar-fill');
+      fill.style.width = pct.toFixed(1) + '%';
+      fill.className = 'quota-bar-fill' + (pct >= 80 ? ' danger' : pct >= 50 ? ' warn' : '');
+
+      const searchCalls  = search > 0  ? Math.round(search / 100) : 0;
+      const chatCalls    = chat > 0    ? Math.round(chat / 5) : 0;
+      const videoCalls   = video;
+      const channelCalls = channel;
+
+      const rows = [
+        { label: 'liveChatMessages.list (chat)', cost: '~5', calls: chatCalls,    sub: chat },
+        { label: 'search.list (fallback live)',  cost: '100', calls: searchCalls,  sub: search },
+        { label: 'videos.list (RSS check)',       cost: '1',  calls: videoCalls,   sub: video },
+        { label: 'channels.list (resolve ID)',    cost: '1',  calls: channelCalls, sub: channel },
+      ];
+
+      const tbody = document.getElementById('quota-tbody');
+      tbody.innerHTML = rows.map(r =>
+        '<tr>' +
+        '<td>' + escapeHTML(r.label) + '</td>' +
+        '<td style="color:var(--muted)">' + r.cost + '</td>' +
+        '<td style="font-family:monospace">' + r.calls.toLocaleString('pt-BR') + '</td>' +
+        '<td style="font-family:monospace;font-weight:600">' + r.sub.toLocaleString('pt-BR') + '</td>' +
+        '</tr>'
+      ).join('') +
+      '<tr style="border-top:1px solid var(--border)">' +
+      '<td colspan="2" style="font-weight:600">Total</td>' +
+      '<td></td>' +
+      '<td style="font-family:monospace;font-weight:700;color:' + (pct >= 80 ? 'var(--yt)' : pct >= 50 ? 'var(--orange)' : 'var(--green)') + '">' +
+        total.toLocaleString('pt-BR') + ' / ' + DAILY_LIMIT.toLocaleString('pt-BR') +
+      '</td></tr>';
+
+      // Timestamp
+      document.getElementById('last-update').textContent = new Date().toLocaleTimeString('pt-BR');
+    }
+
+    async function doToggle() {
+      if (updating) return;
+      updating = true;
+      const newVal = !currentEnabled;
+      try {
+        const res = await fetch('/admin/api/youtube/toggle', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: newVal }),
+        });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const state = await res.json();
+        renderStatus(state);
+      } catch (e) {
+        console.error('toggle:', e);
+        alert('Erro ao alterar estado: ' + e.message);
+      } finally {
+        updating = false;
+      }
+    }
+
+    function escapeHTML(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function escapeAttr(s) {
+      return String(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    async function refresh() {
+      const s = await fetchStatus();
+      renderStatus(s);
+    }
+
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

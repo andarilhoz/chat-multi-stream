@@ -37,8 +37,10 @@ func main() {
 		log.Printf("twitch:  channel → %s", cfg.TwitchChannel)
 	}
 
+	var ytProvider *provider.YouTubeProvider
 	if cfg.YouTubeAPIKey != "" && cfg.YouTubeChannel != "" {
-		providers = append(providers, provider.NewYouTubeProvider(cfg.YouTubeAPIKey, cfg.YouTubeChannel, cfg.YouTubeOfflineRetry))
+		ytProvider = provider.NewYouTubeProvider(cfg.YouTubeAPIKey, cfg.YouTubeChannel, cfg.YouTubeOfflineRetry)
+		providers = append(providers, ytProvider)
 		log.Printf("youtube: channel → %s (offline retry: %s)", cfg.YouTubeChannel, cfg.YouTubeOfflineRetry)
 	}
 
@@ -57,12 +59,15 @@ func main() {
 
 	// ── Start server ───────────────────────────────────────────────────────
 	addr := fmt.Sprintf(":%s", cfg.ServerPort)
-	srv := server.New(addr, messages)
+	srv := server.New(addr, messages, cfg.AdminUser, cfg.AdminPassword, ytProvider)
 
 	log.Printf("server listening on %s", addr)
 	log.Printf("  websocket : ws://localhost%s/ws", addr)
 	log.Printf("  overlay   : http://localhost%s/overlay", addr)
 	log.Printf("  health    : http://localhost%s/health", addr)
+	if cfg.AdminUser != "" && cfg.AdminPassword != "" && ytProvider != nil {
+		log.Printf("  admin     : http://localhost%s/admin", addr)
+	}
 
 	if err := srv.Run(ctx); err != nil {
 		log.Fatalf("server: %v", err)

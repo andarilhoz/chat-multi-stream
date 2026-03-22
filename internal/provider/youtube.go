@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/api/option"
@@ -18,169 +20,253 @@ import (
 )
 
 // errNotLive is returned by findLiveBroadcastViaRSS when the feed is reachable
-// but no active live stream is found. It is distinct from infrastructure errors
-// (network failures, HTTP errors) which warrant a search.list fallback.
+// but no active live stream is found.
 var errNotLive = fmt.Errorf("channel is not live")
 
-// defaultOfflineRetryInterval is the fallback polling interval used when the
-// channel is offline and no custom value was provided via config.
 const defaultOfflineRetryInterval = 60 * time.Second
 
-// YouTubeProvider polls YouTube Live Chat via the Data API v3.
-// A valid API key is required (free tier: 10 000 quota units/day).
-// YouTube does not offer a WebSocket interface — polling is the only approach.
-//
-// The channel handle (e.g. "@mkbhd" or "mkbhd") is resolved to a channel ID
-// at startup. When the channel is not live the provider polls every offlineRetry
-// until a live stream starts, then attaches to its chat automatically.
-type YouTubeProvider struct {
-	apiKey        string
-	channel       string
-	offlineRetry  time.Duration
+// YouTubeQuota tracks estimated YouTube Data API v3 quota usage for the current
+// server session. All fields are updated atomically and reset to zero on restart.
+type YouTubeQuota struct {
+	Total   int64 // total units consumed
+	Search  int64 // search.list calls × 100 units each
+	Video   int64 // videos.list calls × 1 unit each
+	Chat    int64 // liveChatMessages.list calls × ~5 units each
+	Channel int64 // channels.list calls × 1 unit each
 }
 
-// NewYouTubeProvider creates a YouTubeProvider for the given channel handle.
-// The handle may optionally include the '@' prefix (both "@mkbhd" and "mkbhd" work).
-// offlineRetry controls how often the provider checks for a live stream; pass 0
-// to use the default (60 s).
+// YouTubeState is a point-in-time snapshot of the YouTube provider's runtime state.
+type YouTubeState struct {
+	Enabled     bool
+	IsLive      bool
+	VideoID     string
+	VideoURL    string
+	ChannelName string
+	LiveChatID  string
+	Quota       YouTubeQuota
+}
+
+// YouTubeProvider polls YouTube Live Chat via the Data API v3.
+type YouTubeProvider struct {
+	apiKey       string
+	channel      string
+	offlineRetry time.Duration
+
+	mu         sync.RWMutex
+	enabled    bool
+	isLive     bool
+	videoID    string
+	liveChatID string
+
+	quotaTotal   int64
+	quotaSearch  int64
+	quotaVideo   int64
+	quotaChat    int64
+	quotaChannel int64
+}
+
 func NewYouTubeProvider(apiKey string, channel string, offlineRetry time.Duration) *YouTubeProvider {
 	if offlineRetry <= 0 {
 		offlineRetry = defaultOfflineRetryInterval
 	}
-	return &YouTubeProvider{apiKey: apiKey, channel: channel, offlineRetry: offlineRetry}
+	return &YouTubeProvider{
+		apiKey:       apiKey,
+		channel:      channel,
+		offlineRetry: offlineRetry,
+		enabled:      true,
+	}
 }
 
 func (p *YouTubeProvider) Name() domain.Platform {
 	return domain.PlatformYouTube
 }
 
+// SetEnabled enables or disables the YouTube provider at runtime.
+// When disabled the provider stops making API calls (saving quota) but
+// keeps running so it can be re-enabled without restarting the server.
+func (p *YouTubeProvider) SetEnabled(v bool) {
+	p.mu.Lock()
+	p.enabled = v
+	if !v {
+		p.isLive = false
+		p.videoID = ""
+		p.liveChatID = ""
+	}
+	p.mu.Unlock()
+}
+
+// GetState returns a snapshot of the provider's current runtime state.
+func (p *YouTubeProvider) GetState() YouTubeState {
+	p.mu.RLock()
+	enabled := p.enabled
+	isLive := p.isLive
+	videoID := p.videoID
+	liveChatID := p.liveChatID
+	p.mu.RUnlock()
+
+	videoURL := ""
+	if videoID != "" {
+		videoURL = "https://www.youtube.com/watch?v=" + videoID
+	}
+
+	return YouTubeState{
+		Enabled:     enabled,
+		IsLive:      isLive,
+		VideoID:     videoID,
+		VideoURL:    videoURL,
+		ChannelName: p.channel,
+		LiveChatID:  liveChatID,
+		Quota: YouTubeQuota{
+			Total:   atomic.LoadInt64(&p.quotaTotal),
+			Search:  atomic.LoadInt64(&p.quotaSearch),
+			Video:   atomic.LoadInt64(&p.quotaVideo),
+			Chat:    atomic.LoadInt64(&p.quotaChat),
+			Channel: atomic.LoadInt64(&p.quotaChannel),
+		},
+	}
+}
+
+func (p *YouTubeProvider) trackQuota(units int64, category *int64) {
+	atomic.AddInt64(category, units)
+	atomic.AddInt64(&p.quotaTotal, units)
+}
+
 // Connect resolves the channel, waits for it to go live if needed, then polls
-// the live chat. When a stream ends it loops back to waiting for the next one.
-// Blocks until ctx is cancelled or a fatal error occurs.
+// the live chat. Blocks until ctx is cancelled or a fatal error occurs.
 func (p *YouTubeProvider) Connect(ctx context.Context, out chan<- domain.ChatMessage) error {
 	svc, err := youtube.NewService(ctx, option.WithAPIKey(p.apiKey))
 	if err != nil {
 		return fmt.Errorf("youtube: create service: %w", err)
 	}
-
-	return pollChannel(ctx, svc, p.channel, p.offlineRetry, out)
+	return p.pollChannel(ctx, svc, out)
 }
 
-// pollChannel resolves the channel ID once, then loops forever:
-//  1. Waits for an active live broadcast (polling every offlineRetry).
-//  2. Polls the live chat until the stream ends or an error occurs.
-//  3. Goes back to step 1 to catch the next stream.
-//
-// Only returns on ctx cancellation or a fatal error (e.g. invalid API key,
-// channel not found).
-func pollChannel(ctx context.Context, svc *youtube.Service, channelName string, offlineRetry time.Duration, out chan<- domain.ChatMessage) error {
-	channelID, err := resolveYouTubeChannelID(ctx, svc, channelName)
+// pollChannel resolves the channel ID once then loops:
+//  1. If disabled, sleeps 2 s and re-checks.
+//  2. Waits for an active live broadcast (polling every offlineRetry).
+//  3. Polls the live chat until the stream ends or an error occurs.
+//  4. Goes back to step 1.
+func (p *YouTubeProvider) pollChannel(ctx context.Context, svc *youtube.Service, out chan<- domain.ChatMessage) error {
+	channelID, err := p.resolveYouTubeChannelID(ctx, svc, p.channel)
 	if err != nil {
-		// Fatal: channel doesn't exist or API key is bad — no point retrying.
-		return fmt.Errorf("resolve channel %q: %w", channelName, err)
+		return fmt.Errorf("resolve channel %q: %w", p.channel, err)
 	}
-	log.Printf("[youtube] channel %q → ID %s", channelName, channelID)
+	log.Printf("[youtube] channel %q → ID %s", p.channel, channelID)
 
-	// skipVideoID is the last video that ended; we skip it in RSS checks until the
-	// API cache clears and a different (genuinely live) video appears.
 	var skipVideoID string
 
-	// lastSearchCheck tracks the last time we ran a search.list (100 units).
-	// RSS propagation can delay a newly-started stream by 1–5 minutes, so we
-	// run a periodic search.list as a safety net even when RSS says "not live".
-	// Firing every 15 minutes costs at most ~9,600 units/day (under the 10k limit).
 	const periodicSearchInterval = 15 * time.Minute
-	var lastSearchCheck time.Time // zero value means "never checked"
+	var lastSearchCheck time.Time
 
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		// ── Step 1: RSS pre-check (0+1 quota units) ──────────────────────────
-		// The channel Atom feed is public and free. We pull the latest video IDs
-		// and check them with one videos.list call (1 unit) for an active chat.
-		videoID, liveChatID, err := findLiveBroadcastViaRSS(ctx, svc, channelID, skipVideoID)
+		// ── Enabled check — pause without consuming quota ─────────────────────
+		p.mu.RLock()
+		enabled := p.enabled
+		p.mu.RUnlock()
+		if !enabled {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+
+		// ── Step 1: RSS pre-check (0+1 quota units) ───────────────────────────
+		videoID, liveChatID, err := p.findLiveBroadcastViaRSS(ctx, svc, channelID, skipVideoID)
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			if err == errNotLive {
-				// ── Step 1b: periodic search.list safety net (100 units) ─────
-				// RSS doesn't always surface a newly-started stream immediately
-				// (propagation delay). Run search.list every 15 minutes so we
-				// catch streams that aren't in the RSS feed yet.
 				now := time.Now()
 				if now.Sub(lastSearchCheck) >= periodicSearchInterval {
 					lastSearchCheck = now
-					log.Printf("[youtube] %q RSS says not live — running periodic search.list safety check (last checked: %s ago)",
-						channelName, formatDuration(now.Sub(lastSearchCheck)))
-					vid, searchErr := findActiveLiveBroadcast(ctx, svc, channelID)
+					log.Printf("[youtube] %q RSS says not live — running periodic search.list safety check", p.channel)
+					vid, searchErr := p.findActiveLiveBroadcast(ctx, svc, channelID)
 					if searchErr == nil {
-						log.Printf("[youtube] search.list found live video %q for %q — was missing from RSS", vid, channelName)
-						chatID, chatErr := getLiveChatID(ctx, svc, vid)
+						log.Printf("[youtube] search.list found live video %q for %q — was missing from RSS", vid, p.channel)
+						chatID, chatErr := p.getLiveChatID(ctx, svc, vid)
 						if chatErr == nil {
 							videoID = vid
 							liveChatID = chatID
-							err = nil // fall through to polling below
+							err = nil
 						} else {
-							log.Printf("[youtube] could not get live chat for %q (%v) — retrying in %s", channelName, chatErr, offlineRetry)
+							log.Printf("[youtube] could not get live chat for %q (%v) — retrying in %s", p.channel, chatErr, p.offlineRetry)
 						}
 					} else {
-						log.Printf("[youtube] search.list confirms %q is not live (%v)", channelName, searchErr)
+						log.Printf("[youtube] search.list confirms %q is not live (%v)", p.channel, searchErr)
 					}
 				}
 
 				if err == errNotLive {
-					log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
+					log.Printf("[youtube] %q is not live — checking again in %s", p.channel, p.offlineRetry)
+					p.mu.Lock()
+					p.isLive = false
+					p.videoID = ""
+					p.liveChatID = ""
+					p.mu.Unlock()
 					select {
 					case <-ctx.Done():
 						return nil
-					case <-time.After(offlineRetry):
+					case <-time.After(p.offlineRetry):
 					}
 					continue
 				}
 			} else {
-				// RSS feed itself failed (network/HTTP error) — fall back to search.list immediately.
-				log.Printf("[youtube] RSS unavailable for %q (%v) — falling back to search.list", channelName, err)
+				log.Printf("[youtube] RSS unavailable for %q (%v) — falling back to search.list", p.channel, err)
 				lastSearchCheck = time.Now()
-				videoID, err = findActiveLiveBroadcast(ctx, svc, channelID)
+				videoID, err = p.findActiveLiveBroadcast(ctx, svc, channelID)
 				if err != nil {
-					log.Printf("[youtube] %q is not live — checking again in %s", channelName, offlineRetry)
+					log.Printf("[youtube] %q is not live — checking again in %s", p.channel, p.offlineRetry)
 					select {
 					case <-ctx.Done():
 						return nil
-					case <-time.After(offlineRetry):
+					case <-time.After(p.offlineRetry):
 					}
 					continue
 				}
-				liveChatID, err = getLiveChatID(ctx, svc, videoID)
+				liveChatID, err = p.getLiveChatID(ctx, svc, videoID)
 				if err != nil {
-					log.Printf("[youtube] could not get live chat for %q: %v — retrying in %s", channelName, err, offlineRetry)
+					log.Printf("[youtube] could not get live chat for %q: %v — retrying in %s", p.channel, err, p.offlineRetry)
 					select {
 					case <-ctx.Done():
 						return nil
-					case <-time.After(offlineRetry):
+					case <-time.After(p.offlineRetry):
 					}
 					continue
 				}
 			}
 		}
-		log.Printf("[youtube] channel %q is live: video %s, chat %s", channelName, videoID, liveChatID)
-		skipVideoID = "" // clear: we have a confirmed new stream
-		lastSearchCheck = time.Time{} // reset so next offline period starts fresh
+
+		log.Printf("[youtube] channel %q is live: video %s, chat %s", p.channel, videoID, liveChatID)
+		skipVideoID = ""
+		lastSearchCheck = time.Time{}
+
+		p.mu.Lock()
+		p.isLive = true
+		p.videoID = videoID
+		p.liveChatID = liveChatID
+		p.mu.Unlock()
 
 		// ── Step 2: poll chat until stream ends ───────────────────────────────
-		if err := pollLiveChat(ctx, svc, liveChatID, channelName, channelID, out); err != nil && ctx.Err() == nil {
-			log.Printf("[youtube] chat ended for %q (%v) — watching for next stream", channelName, err)
+		if err := p.pollLiveChat(ctx, svc, liveChatID, p.channel, channelID, out); err != nil && ctx.Err() == nil {
+			log.Printf("[youtube] chat ended for %q (%v) — watching for next stream", p.channel, err)
 		}
-		// Mark this video as dead so stale API cache doesn't re-detect it as live.
+
+		p.mu.Lock()
+		p.isLive = false
+		p.liveChatID = ""
+		p.mu.Unlock()
+
 		skipVideoID = videoID
 	}
 }
 
-// formatDuration formats a duration as a human-readable string (e.g. "2m30s").
-// Returns "never" for zero values to make log messages clearer.
 func formatDuration(d time.Duration) string {
 	if d <= 0 {
 		return "never"
@@ -188,23 +274,20 @@ func formatDuration(d time.Duration) string {
 	return d.Truncate(time.Second).String()
 }
 
-// resolveYouTubeChannelID converts a channel handle (e.g. "@mkbhd" or "mkbhd") or
-// legacy username into a YouTube channel ID.
-func resolveYouTubeChannelID(ctx context.Context, svc *youtube.Service, name string) (string, error) {
-	// Normalise: ensure the handle has the '@' prefix for the forHandle API.
+func (p *YouTubeProvider) resolveYouTubeChannelID(ctx context.Context, svc *youtube.Service, name string) (string, error) {
 	handle := name
 	if !strings.HasPrefix(handle, "@") {
 		handle = "@" + handle
 	}
 
-	// Try forHandle first (works for all modern YouTube channels).
 	resp, err := svc.Channels.List([]string{"id"}).ForHandle(handle).Context(ctx).Do()
+	p.trackQuota(1, &p.quotaChannel)
 	if err == nil && len(resp.Items) > 0 {
 		return resp.Items[0].Id, nil
 	}
 
-	// Fall back to legacy forUsername lookup (older channels without handles).
 	resp, err = svc.Channels.List([]string{"id"}).ForUsername(strings.TrimPrefix(name, "@")).Context(ctx).Do()
+	p.trackQuota(1, &p.quotaChannel)
 	if err != nil {
 		return "", fmt.Errorf("username lookup failed: %w", err)
 	}
@@ -214,11 +297,7 @@ func resolveYouTubeChannelID(ctx context.Context, svc *youtube.Service, name str
 	return resp.Items[0].Id, nil
 }
 
-// findLiveBroadcastViaRSS finds an active live stream using the channel's public Atom
-// feed (zero API quota cost) followed by a single videos.list call (1 quota unit).
-// It returns the video ID and active live chat ID, or a non-nil error when the channel
-// is offline or the feed is temporarily unavailable.
-func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelID string, skipVideoID string) (videoID, liveChatID string, err error) {
+func (p *YouTubeProvider) findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelID string, skipVideoID string) (videoID, liveChatID string, err error) {
 	feedURL := "https://www.youtube.com/feeds/videos.xml?channel_id=" + url.QueryEscape(channelID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, feedURL, nil)
 	if err != nil {
@@ -252,7 +331,6 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 		}
 	}
 
-	// Check the latest videos (up to 5) in one videos.list call — 1 quota unit.
 	if len(ids) > 5 {
 		ids = ids[:5]
 	}
@@ -263,24 +341,21 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 		Id(strings.Join(ids, ",")).
 		Context(ctx).
 		Do()
+	p.trackQuota(1, &p.quotaVideo)
 	if err != nil {
 		return "", "", fmt.Errorf("videos.list: %w", err)
 	}
 
-	// Build a set of IDs that videos.list actually returned.
-	// YouTube silently omits videos that are very new (not yet indexed),
-	// members-only, or otherwise inaccessible with a public API key.
-	// A missing ID is suspicious — the channel may actually be live.
 	returnedIDs := make(map[string]struct{}, len(vResp.Items))
 	for _, item := range vResp.Items {
 		returnedIDs[item.Id] = struct{}{}
 	}
 	for _, id := range ids {
 		if id == skipVideoID {
-			continue // already known-dead, absence is expected
+			continue
 		}
 		if _, found := returnedIDs[id]; !found {
-			log.Printf("[youtube/rss] video %s: NOT returned by videos.list (new/unindexed or members-only) — falling back to search.list", id)
+			log.Printf("[youtube/rss] video %s: NOT returned by videos.list — falling back to search.list", id)
 			return "", "", fmt.Errorf("video %s missing from videos.list response", id)
 		}
 	}
@@ -297,21 +372,17 @@ func findLiveBroadcastViaRSS(ctx context.Context, svc *youtube.Service, channelI
 		}
 		log.Printf("[youtube/rss] video %s: activeLiveChatId=%q actualStartTime=%q actualEndTime=%q",
 			item.Id, d.ActiveLiveChatId, d.ActualStartTime, d.ActualEndTime)
-		// A truly live stream has: chat ID set, stream has started (ActualStartTime != ""),
-		// and stream has not ended (ActualEndTime == "").
-		// Upcoming/scheduled streams also have a chat ID but ActualStartTime is empty — skip those.
 		if d.ActiveLiveChatId != "" && d.ActualStartTime != "" && d.ActualEndTime == "" {
 			return item.Id, d.ActiveLiveChatId, nil
 		}
 	}
-	// Feed was reachable and all video IDs were accounted for — channel is simply not live.
 	log.Printf("[youtube/rss] channel %s: no active live stream found → errNotLive", channelID)
 	return "", "", errNotLive
 }
 
 // findActiveLiveBroadcast searches for a currently live video on the given channel.
 // Costs 100 quota units — used only as a fallback when the RSS check fails.
-func findActiveLiveBroadcast(ctx context.Context, svc *youtube.Service, channelID string) (string, error) {
+func (p *YouTubeProvider) findActiveLiveBroadcast(ctx context.Context, svc *youtube.Service, channelID string) (string, error) {
 	resp, err := svc.Search.
 		List([]string{"id"}).
 		ChannelId(channelID).
@@ -319,6 +390,7 @@ func findActiveLiveBroadcast(ctx context.Context, svc *youtube.Service, channelI
 		Type("video").
 		Context(ctx).
 		Do()
+	p.trackQuota(100, &p.quotaSearch)
 	if err != nil {
 		return "", fmt.Errorf("search live broadcasts: %w", err)
 	}
@@ -329,12 +401,13 @@ func findActiveLiveBroadcast(ctx context.Context, svc *youtube.Service, channelI
 }
 
 // getLiveChatID fetches the activeLiveChatId for a video that is currently live.
-func getLiveChatID(ctx context.Context, svc *youtube.Service, videoID string) (string, error) {
+func (p *YouTubeProvider) getLiveChatID(ctx context.Context, svc *youtube.Service, videoID string) (string, error) {
 	resp, err := svc.Videos.
 		List([]string{"liveStreamingDetails"}).
 		Id(videoID).
 		Context(ctx).
 		Do()
+	p.trackQuota(1, &p.quotaVideo)
 	if err != nil {
 		return "", fmt.Errorf("get video %s: %w", videoID, err)
 	}
@@ -350,13 +423,19 @@ func getLiveChatID(ctx context.Context, svc *youtube.Service, videoID string) (s
 
 // pollLiveChat polls a live chat for new messages, forwarding each one to out.
 // It respects the pollingIntervalMillis from each API response to avoid quota exhaustion.
-// channelID is the resolved YouTube channel ID and is attached to every message so the
-// frontend can perform channel-scoped emoji lookups.
-func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channelName, channelID string, out chan<- domain.ChatMessage) error {
+func (p *YouTubeProvider) pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channelName, channelID string, out chan<- domain.ChatMessage) error {
 	var pageToken string
 	for {
 		if ctx.Err() != nil {
 			return nil
+		}
+
+		// Stop polling if disabled mid-stream.
+		p.mu.RLock()
+		enabled := p.enabled
+		p.mu.RUnlock()
+		if !enabled {
+			return fmt.Errorf("provider disabled")
 		}
 
 		call := svc.LiveChatMessages.
@@ -367,6 +446,7 @@ func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channel
 		}
 
 		resp, err := call.Do()
+		p.trackQuota(5, &p.quotaChat)
 		if err != nil {
 			return fmt.Errorf("list messages: %w", err)
 		}
@@ -377,14 +457,9 @@ func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channel
 				ts = time.Now()
 			}
 
-			// For text messages use the raw message field so emoji shortcodes
-			// are preserved exactly as the user typed them. For all other event
-			// types (superChatEvent, memberMilestoneChatEvent, etc.) fall back
-			// to DisplayMessage which already contains a human-readable summary.
 			text := item.Snippet.DisplayMessage
 			if item.Snippet.Type == "textMessageEvent" && item.Snippet.TextMessageDetails != nil {
 				text = item.Snippet.TextMessageDetails.MessageText
-				// Debug: log first few chars to see if shortcodes are present
 				preview := text
 				if len(preview) > 120 {
 					preview = preview[:120] + "…"
@@ -408,7 +483,6 @@ func pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channel
 
 		pageToken = resp.NextPageToken
 
-		// Respect the polling interval the API provides to avoid quota exhaustion.
 		interval := time.Duration(resp.PollingIntervalMillis) * time.Millisecond
 		if interval < time.Second {
 			interval = time.Second

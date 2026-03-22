@@ -11,3 +11,5 @@ services:
       - YOUTUBE_API_KEY=
       - YOUTUBE_CHANNEL=
       - KICK_CHANNEL=
+      - ADMIN_USER=
+      - ADMIN_PASSWORD=

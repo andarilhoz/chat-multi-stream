@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	_ "embed"
 	"log"
@@ -11,30 +12,51 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/magnogouveia/chat-multi-stream/internal/domain"
+	"github.com/magnogouveia/chat-multi-stream/internal/provider"
 )
 
 //go:embed static/overlay.html
 var overlayHTML []byte
 
+//go:embed static/obs.html
+var obsHTML []byte
+
+//go:embed static/admin.html
+var adminHTML []byte
+
 // Server owns the HTTP server and the WebSocket broadcast hub.
 type Server struct {
-	httpServer *http.Server
-	messages   <-chan domain.ChatMessage
-	hub        *hub
+	httpServer    *http.Server
+	messages      <-chan domain.ChatMessage
+	hub           *hub
+	adminUser     string
+	adminPassword string
+	ytProvider    *provider.YouTubeProvider
 }
 
 // New creates a Server that reads from messages and broadcasts to all connected
 // WebSocket clients. addr should be the listen address (e.g. ":8080").
-func New(addr string, messages <-chan domain.ChatMessage) *Server {
+// Provide non-empty adminUser/adminPassword and a ytProvider to enable the /admin dashboard.
+func New(addr string, messages <-chan domain.ChatMessage, adminUser, adminPassword string, ytProvider *provider.YouTubeProvider) *Server {
 	s := &Server{
-		messages: messages,
-		hub:      newHub(),
+		messages:      messages,
+		hub:           newHub(),
+		adminUser:     adminUser,
+		adminPassword: adminPassword,
+		ytProvider:    ytProvider,
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws",      s.handleWS)
 	mux.HandleFunc("/overlay", s.handleOverlay)
+	mux.HandleFunc("/obs",     s.handleOBS)
 	mux.HandleFunc("/health",  s.handleHealth)
+
+	if adminUser != "" && adminPassword != "" && ytProvider != nil {
+		mux.HandleFunc("/admin", s.basicAuth(s.handleAdmin))
+		mux.HandleFunc("/admin/api/status", s.basicAuth(s.handleAdminStatus))
+		mux.HandleFunc("/admin/api/youtube/toggle", s.basicAuth(s.handleAdminToggle))
+	}
 
 	s.httpServer = &http.Server{
 		Addr:    addr,
@@ -72,7 +94,7 @@ func (s *Server) broadcaster(ctx context.Context) {
 			return
 		case msg, ok := <-s.messages:
 			if !ok {
-				return // channel closed (aggregator done)
+				return
 			}
 			s.hub.broadcast(msg)
 		}
@@ -109,7 +131,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 			return
 		case msg, ok := <-c.send:
 			if !ok {
-				return // hub unregistered this client
+				return
 			}
 			data, err := json.Marshal(msg)
 			if err != nil {
@@ -130,10 +152,71 @@ func (s *Server) handleOverlay(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(overlayHTML)
 }
 
+// handleOBS serves the OBS overlay with black background and bubble-style chat.
+func (s *Server) handleOBS(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(obsHTML)
+}
+
 // handleHealth returns a simple JSON health check.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// ── Admin ─────────────────────────────────────────────────────────────────────
+
+// basicAuth wraps a handler with HTTP Basic Authentication.
+// It uses constant-time comparison to prevent timing attacks.
+func (s *Server) basicAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		if !ok ||
+			subtle.ConstantTimeCompare([]byte(user), []byte(s.adminUser)) != 1 ||
+			subtle.ConstantTimeCompare([]byte(pass), []byte(s.adminPassword)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="admin"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// handleAdmin serves the admin dashboard HTML.
+func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(adminHTML)
+}
+
+// handleAdminStatus returns the current YouTube provider state as JSON.
+func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	state := s.ytProvider.GetState()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(state)
+}
+
+// handleAdminToggle accepts a JSON body {"enabled": bool} and updates the
+// YouTube provider's enabled state.
+func (s *Server) handleAdminToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	s.ytProvider.SetEnabled(body.Enabled)
+	log.Printf("[admin] YouTube provider enabled=%v", body.Enabled)
+
+	state := s.ytProvider.GetState()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(state)
 }
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
@@ -160,7 +243,6 @@ func (h *hub) register(c *client) {
 }
 
 // unregister removes the client from the hub and closes its send channel.
-// It is idempotent — safe to call more than once for the same client.
 func (h *hub) unregister(c *client) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -179,9 +261,8 @@ func (h *hub) broadcast(msg domain.ChatMessage) {
 		select {
 		case c.send <- msg:
 		default:
-			// Drop message for slow consumer — prefer stream continuity over
-			// guaranteed delivery.
 			log.Printf("[server] client send buffer full, dropping message")
 		}
 	}
 }
+
