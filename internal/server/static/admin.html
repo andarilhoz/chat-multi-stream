@@ -221,6 +221,53 @@
 
     .quota-table tr:last-child td { border-bottom: none; }
 
+    /* ── Chat URL input ── */
+    .url-input-row {
+      display: flex;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    .url-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-size: 13px;
+      padding: 7px 10px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+
+    .url-input:focus { border-color: var(--yt); }
+    .url-input::placeholder { color: var(--muted); }
+
+    .save-btn {
+      background: var(--yt);
+      border: none;
+      border-radius: 6px;
+      color: #fff;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 7px 16px;
+      transition: opacity 0.2s;
+      white-space: nowrap;
+    }
+
+    .save-btn:hover { opacity: 0.85; }
+    .save-btn:disabled { opacity: 0.4; cursor: default; }
+
+    .url-feedback {
+      font-size: 11px;
+      margin-top: 6px;
+      min-height: 14px;
+    }
+
+    .url-feedback.ok  { color: var(--green); }
+    .url-feedback.err { color: var(--yt); }
+
     /* ── Footer ── */
     .footer {
       margin-top: 20px;
@@ -235,6 +282,21 @@
   <h1>⚙ chat-multi-stream · admin</h1>
 
   <div class="grid">
+
+    <!-- Chat URL card -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>URL do Chat do YouTube</h2>
+      <p style="font-size:12px;color:var(--muted);margin-bottom:12px;">
+        Cole o link da live ou do chat do YouTube. O sistema extrai o video ID e começa a ler o chat automaticamente.
+        Formatos aceitos: <code style="color:var(--text)">watch?v=…</code>, <code style="color:var(--text)">/live/…</code>, <code style="color:var(--text)">youtu.be/…</code>
+      </p>
+      <div class="url-input-row">
+        <input id="chat-url-input" class="url-input" type="url"
+          placeholder="https://www.youtube.com/watch?v=..." autocomplete="off" />
+        <button id="save-btn" class="save-btn" onclick="saveChatURL()">Salvar</button>
+      </div>
+      <div id="url-feedback" class="url-feedback"></div>
+    </div>
 
     <!-- Toggle card -->
     <div class="card">
@@ -362,11 +424,9 @@
 
       // Quota
       const q = s.Quota || {};
-      const total   = q.Total   || 0;
-      const search  = q.Search  || 0;
-      const chat    = q.Chat    || 0;
-      const video   = q.Video   || 0;
-      const channel = q.Channel || 0;
+      const total    = q.Total || 0;
+      const chat     = q.Chat  || 0;
+      const video    = q.Video || 0;
 
       document.getElementById('quota-used-label').textContent = total.toLocaleString('pt-BR') + ' unidades usadas';
 
@@ -375,16 +435,12 @@
       fill.style.width = pct.toFixed(1) + '%';
       fill.className = 'quota-bar-fill' + (pct >= 80 ? ' danger' : pct >= 50 ? ' warn' : '');
 
-      const searchCalls  = search > 0  ? Math.round(search / 100) : 0;
-      const chatCalls    = chat > 0    ? Math.round(chat / 5) : 0;
+      const chatCalls    = chat  > 0 ? Math.round(chat / 5) : 0;
       const videoCalls   = video;
-      const channelCalls = channel;
 
       const rows = [
-        { label: 'liveChatMessages.list (chat)', cost: '~5', calls: chatCalls,    sub: chat },
-        { label: 'search.list (fallback live)',  cost: '100', calls: searchCalls,  sub: search },
-        { label: 'videos.list (RSS check)',       cost: '1',  calls: videoCalls,   sub: video },
-        { label: 'channels.list (resolve ID)',    cost: '1',  calls: channelCalls, sub: channel },
+        { label: 'liveChatMessages.list (chat)', cost: '~5', calls: chatCalls, sub: chat },
+        { label: 'videos.list (obter live chat ID)', cost: '1', calls: videoCalls, sub: video },
       ];
 
       const tbody = document.getElementById('quota-tbody');
@@ -405,6 +461,38 @@
 
       // Timestamp
       document.getElementById('last-update').textContent = new Date().toLocaleTimeString('pt-BR');
+    }
+
+    async function saveChatURL() {
+      const input = document.getElementById('chat-url-input');
+      const feedback = document.getElementById('url-feedback');
+      const btn = document.getElementById('save-btn');
+      const url = input.value.trim();
+
+      btn.disabled = true;
+      feedback.textContent = '';
+      feedback.className = 'url-feedback';
+
+      try {
+        const res = await fetch('/admin/api/youtube/chaturl', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url }),
+        });
+        if (!res.ok) {
+          const msg = await res.text();
+          throw new Error(msg || 'HTTP ' + res.status);
+        }
+        const state = await res.json();
+        renderStatus(state);
+        feedback.textContent = url ? '✓ URL salva — aguardando conexão com o chat…' : '✓ URL removida.';
+        feedback.className = 'url-feedback ok';
+      } catch (e) {
+        feedback.textContent = '✗ ' + e.message;
+        feedback.className = 'url-feedback err';
+      } finally {
+        btn.disabled = false;
+      }
     }
 
     async function doToggle() {

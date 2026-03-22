@@ -56,6 +56,7 @@ func New(addr string, messages <-chan domain.ChatMessage, adminUser, adminPasswo
 		mux.HandleFunc("/admin", s.basicAuth(s.handleAdmin))
 		mux.HandleFunc("/admin/api/status", s.basicAuth(s.handleAdminStatus))
 		mux.HandleFunc("/admin/api/youtube/toggle", s.basicAuth(s.handleAdminToggle))
+		mux.HandleFunc("/admin/api/youtube/chaturl", s.basicAuth(s.handleAdminChatURL))
 	}
 
 	s.httpServer = &http.Server{
@@ -190,6 +191,33 @@ func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
 
 // handleAdminStatus returns the current YouTube provider state as JSON.
 func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
+	state := s.ytProvider.GetState()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(state)
+}
+
+// handleAdminChatURL accepts a JSON body {"url": "..."}`, parses the YouTube
+// video/stream URL, and hands the extracted video ID to the YouTube provider.
+func (s *Server) handleAdminChatURL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.ytProvider.SetChatURL(body.URL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	log.Printf("[admin] YouTube chat URL definida: %q", body.URL)
+
 	state := s.ytProvider.GetState()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(state)

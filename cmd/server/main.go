@@ -38,10 +38,10 @@ func main() {
 	}
 
 	var ytProvider *provider.YouTubeProvider
-	if cfg.YouTubeAPIKey != "" && cfg.YouTubeChannel != "" {
-		ytProvider = provider.NewYouTubeProvider(cfg.YouTubeAPIKey, cfg.YouTubeChannel, cfg.YouTubeOfflineRetry)
+	if cfg.YouTubeAPIKey != "" {
+		ytProvider = provider.NewYouTubeProvider(cfg.YouTubeAPIKey, cfg.YouTubeChannel)
 		providers = append(providers, ytProvider)
-		log.Printf("youtube: channel → %s (offline retry: %s)", cfg.YouTubeChannel, cfg.YouTubeOfflineRetry)
+		log.Printf("youtube: API key configurada (defina a URL do chat no painel admin)")
 	}
 
 	if cfg.KickChannel != "" {
