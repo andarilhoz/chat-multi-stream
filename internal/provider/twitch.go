@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -61,6 +62,13 @@ func (p *TwitchProvider) Connect(ctx context.Context, out chan<- domain.ChatMess
 			}
 		}
 
+		// Extract badge names (broadcaster, moderator, subscriber, vip, etc.).
+		badgeNames := make([]string, 0, len(msg.User.Badges))
+		for name := range msg.User.Badges {
+			badgeNames = append(badgeNames, name)
+		}
+		sort.Strings(badgeNames)
+
 		// Prefer the room-id from ROOMSTATE; fall back to the tag on the message itself.
 		channelID := msg.RoomID
 		if channelID == "" {
@@ -79,6 +87,7 @@ func (p *TwitchProvider) Connect(ctx context.Context, out chan<- domain.ChatMess
 			ChannelID: channelID,
 			Username:  msg.User.DisplayName,
 			Message:   msg.Message,
+			Badges:    badgeNames,
 			Emotes:    emotes,
 			Timestamp: ts,
 		}:

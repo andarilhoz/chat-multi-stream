@@ -29,6 +29,8 @@ type ChatMessage struct {
 	ChannelID string      `json:"channel_id,omitempty"`
 	Username  string      `json:"username"`
 	Message   string      `json:"message"`
+	// Badges holds platform badge identifiers for this user (e.g. "broadcaster", "moderator").
+	Badges    []string    `json:"badges,omitempty"`
 	// Emotes holds platform-native emotes detected in this message (e.g. Twitch IRC emotes).
 	Emotes    []EmoteInfo `json:"emotes,omitempty"`
 	Timestamp time.Time   `json:"timestamp"`

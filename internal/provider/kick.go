@@ -111,6 +111,11 @@ type kickChatData struct {
 	CreatedAt string `json:"created_at"`
 	Sender    struct {
 		Username string `json:"username"`
+		Identity *struct {
+			Badges []struct {
+				Type string `json:"type"`
+			} `json:"badges"`
+		} `json:"identity"`
 	} `json:"sender"`
 }
 
@@ -169,11 +174,21 @@ func parseKickChatData(raw json.RawMessage, channelName string) (domain.ChatMess
 		ts = time.Now()
 	}
 
+	var kickBadges []string
+	if data.Sender.Identity != nil {
+		for _, b := range data.Sender.Identity.Badges {
+			if b.Type != "" {
+				kickBadges = append(kickBadges, b.Type)
+			}
+		}
+	}
+
 	return domain.ChatMessage{
 		Platform:  domain.PlatformKick,
 		Channel:   channelName,
 		Username:  data.Sender.Username,
 		Message:   data.Content,
+		Badges:    kickBadges,
 		Timestamp: ts,
 	}, nil
 }

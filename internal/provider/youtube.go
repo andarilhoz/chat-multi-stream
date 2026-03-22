@@ -467,6 +467,17 @@ func (p *YouTubeProvider) pollLiveChat(ctx context.Context, svc *youtube.Service
 				log.Printf("[youtube/msg] raw=%q display=%q", preview, item.Snippet.DisplayMessage)
 			}
 
+			var ytBadges []string
+			if item.AuthorDetails.IsChatOwner {
+				ytBadges = append(ytBadges, "owner")
+			}
+			if item.AuthorDetails.IsChatModerator {
+				ytBadges = append(ytBadges, "moderator")
+			}
+			if item.AuthorDetails.IsChatSponsor {
+				ytBadges = append(ytBadges, "member")
+			}
+
 			select {
 			case <-ctx.Done():
 				return nil
@@ -476,6 +487,7 @@ func (p *YouTubeProvider) pollLiveChat(ctx context.Context, svc *youtube.Service
 				ChannelID: channelID,
 				Username:  strings.TrimPrefix(item.AuthorDetails.DisplayName, "@"),
 				Message:   text,
+				Badges:    ytBadges,
 				Timestamp: ts,
 			}:
 			}
