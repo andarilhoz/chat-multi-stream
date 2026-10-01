@@ -435,11 +435,11 @@
       fill.style.width = pct.toFixed(1) + '%';
       fill.className = 'quota-bar-fill' + (pct >= 80 ? ' danger' : pct >= 50 ? ' warn' : '');
 
-      const chatCalls    = chat  > 0 ? Math.round(chat / 5) : 0;
+      const chatCalls    = chat;
       const videoCalls   = video;
 
       const rows = [
-        { label: 'liveChatMessages.list (chat)', cost: '~5', calls: chatCalls, sub: chat },
+        { label: 'liveChatMessages.streamList (conexões do chat)', cost: '1 (estimado)', calls: chatCalls, sub: chat },
         { label: 'videos.list (obter live chat ID)', cost: '1', calls: videoCalls, sub: video },
       ];
 
