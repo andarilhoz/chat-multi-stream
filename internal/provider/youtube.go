@@ -2,7 +2,9 @@ package provider
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"strings"
@@ -12,16 +14,24 @@ import (
 
 	"google.golang.org/api/option"
 	"google.golang.org/api/youtube/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 
 	"github.com/magnogouveia/chat-multi-stream/internal/domain"
+	"github.com/magnogouveia/chat-multi-stream/internal/provider/ytgrpc"
 )
+
+const youtubeGRPCTarget = "youtube.googleapis.com:443"
 
 // YouTubeQuota tracks estimated YouTube Data API v3 quota usage for the current
 // server session. All fields are updated atomically and reset to zero on restart.
 type YouTubeQuota struct {
 	Total int64 // total units consumed
 	Video int64 // videos.list calls × 1 unit each
-	Chat  int64 // liveChatMessages.list calls × ~5 units each
+	Chat  int64 // liveChatMessages.streamList connections × 1 unit each (cost not documented by Google)
 }
 
 // YouTubeState is a point-in-time snapshot of the YouTube provider's runtime state.
@@ -163,13 +173,18 @@ func (p *YouTubeProvider) Connect(ctx context.Context, out chan<- domain.ChatMes
 	if err != nil {
 		return fmt.Errorf("youtube: create service: %w", err)
 	}
-	return p.waitAndPoll(ctx, svc, out)
+	conn, err := grpc.NewClient(youtubeGRPCTarget, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})))
+	if err != nil {
+		return fmt.Errorf("youtube: dial grpc: %w", err)
+	}
+	defer conn.Close()
+	return p.waitAndPoll(ctx, svc, conn, out)
 }
 
 // waitAndPoll loops waiting for a videoID to be set via SetChatURL.
-// Once set, it fetches the live chat ID and starts polling messages.
+// Once set, it fetches the live chat ID and starts streaming messages.
 // When the stream ends or the provider is disabled, it goes back to waiting.
-func (p *YouTubeProvider) waitAndPoll(ctx context.Context, svc *youtube.Service, out chan<- domain.ChatMessage) error {
+func (p *YouTubeProvider) waitAndPoll(ctx context.Context, svc *youtube.Service, conn *grpc.ClientConn, out chan<- domain.ChatMessage) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -206,7 +221,7 @@ func (p *YouTubeProvider) waitAndPoll(ctx context.Context, svc *youtube.Service,
 		p.liveChatID = liveChatID
 		p.mu.Unlock()
 
-		if err := p.pollLiveChat(ctx, svc, liveChatID, p.channel, videoID, out); err != nil && ctx.Err() == nil {
+		if err := p.streamLiveChat(ctx, conn, liveChatID, p.channel, videoID, out); err != nil && ctx.Err() == nil {
 			log.Printf("[youtube] chat encerrado para vídeo %s (%v) — aguardando nova URL", videoID, err)
 		}
 
@@ -239,88 +254,135 @@ func (p *YouTubeProvider) getLiveChatID(ctx context.Context, svc *youtube.Servic
 	return liveChatID, nil
 }
 
-// pollLiveChat polls a live chat for new messages, forwarding each one to out.
-// It respects the pollingIntervalMillis from each API response to avoid quota exhaustion.
-func (p *YouTubeProvider) pollLiveChat(ctx context.Context, svc *youtube.Service, liveChatID, channelName, channelID string, out chan<- domain.ChatMessage) error {
-	var pageToken string
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
+// streamLiveChat consumes a live chat through the gRPC liveChatMessages.streamList
+// method, forwarding each message to out. The server pushes messages as they
+// arrive, so there is no polling interval. When the stream drops it reconnects
+// from the last nextPageToken, so no messages are lost or repeated.
+func (p *YouTubeProvider) streamLiveChat(ctx context.Context, conn *grpc.ClientConn, liveChatID, channelName, videoID string, out chan<- domain.ChatMessage) error {
+	client := ytgrpc.NewV3DataLiveChatMessageServiceClient(conn)
 
-		// Stop polling if disabled mid-stream.
-		p.mu.RLock()
-		enabled := p.enabled
-		p.mu.RUnlock()
-		if !enabled {
-			return fmt.Errorf("provider disabled")
-		}
-
-		call := svc.LiveChatMessages.
-			List(liveChatID, []string{"snippet", "authorDetails"}).
-			Context(ctx)
-		if pageToken != "" {
-			call = call.PageToken(pageToken)
-		}
-
-		resp, err := call.Do()
-		p.trackQuota(5, &p.quotaChat)
-		if err != nil {
-			return fmt.Errorf("list messages: %w", err)
-		}
-
-		for _, item := range resp.Items {
-			ts, err := time.Parse(time.RFC3339Nano, item.Snippet.PublishedAt)
-			if err != nil {
-				ts = time.Now()
-			}
-
-			text := item.Snippet.DisplayMessage
-			if item.Snippet.Type == "textMessageEvent" && item.Snippet.TextMessageDetails != nil {
-				text = item.Snippet.TextMessageDetails.MessageText
-				preview := text
-				if len(preview) > 120 {
-					preview = preview[:120] + "…"
-				}
-				log.Printf("[youtube/msg] raw=%q display=%q", preview, item.Snippet.DisplayMessage)
-			}
-
-			var ytBadges []string
-			if item.AuthorDetails.IsChatOwner {
-				ytBadges = append(ytBadges, "owner")
-			}
-			if item.AuthorDetails.IsChatModerator {
-				ytBadges = append(ytBadges, "moderator")
-			}
-			if item.AuthorDetails.IsChatSponsor {
-				ytBadges = append(ytBadges, "member")
-			}
-
+	// Cancel the stream when the provider is disabled or the video URL changes.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for {
 			select {
 			case <-ctx.Done():
-				return nil
-			case out <- domain.ChatMessage{
-				Platform:  domain.PlatformYouTube,
-				Channel:   channelName,
-				ChannelID: channelID,
-				Username:  strings.TrimPrefix(item.AuthorDetails.DisplayName, "@"),
-				Message:   text,
-				Badges:    ytBadges,
-				Timestamp: ts,
-			}:
+				return
+			case <-t.C:
+				p.mu.RLock()
+				stop := !p.enabled || p.videoID != videoID
+				p.mu.RUnlock()
+				if stop {
+					cancel()
+					return
+				}
 			}
 		}
+	}()
 
-		pageToken = resp.NextPageToken
-
-		interval := time.Duration(resp.PollingIntervalMillis) * time.Millisecond
-		if interval < time.Second {
-			interval = time.Second
+	streamCtx := metadata.AppendToOutgoingContext(ctx, "x-goog-api-key", p.apiKey)
+	var pageToken string
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return fmt.Errorf("stopped")
 		}
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-time.After(interval):
+
+		stream, err := client.StreamList(streamCtx, &ytgrpc.LiveChatMessageListRequest{
+			LiveChatId: liveChatID,
+			Part:       []string{"snippet", "authorDetails"},
+			MaxResults: 500,
+			PageToken:  pageToken,
+		})
+		p.trackQuota(1, &p.quotaChat)
+		if err != nil {
+			return fmt.Errorf("stream list: %w", err)
+		}
+
+		for {
+			resp, err := stream.Recv()
+			if err != nil {
+				if ctx.Err() != nil {
+					return fmt.Errorf("stopped")
+				}
+				switch status.Code(err) {
+				case codes.NotFound, codes.PermissionDenied, codes.FailedPrecondition,
+					codes.InvalidArgument, codes.Unauthenticated, codes.ResourceExhausted:
+					return fmt.Errorf("stream list: %w", err)
+				}
+				if err == io.EOF {
+					// The server closes idle streams periodically; resume from the last token.
+					break
+				}
+				// Transient error: back off, then reconnect from the last token.
+				log.Printf("[youtube] stream interrompido (%v) — reconectando em %s", err, backoff)
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("stopped")
+				case <-time.After(backoff):
+				}
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				break
+			}
+			backoff = time.Second
+
+			for _, item := range resp.GetItems() {
+				snip := item.GetSnippet()
+				if snip.GetType() == ytgrpc.LiveChatMessageSnippet_CHAT_ENDED_EVENT {
+					return fmt.Errorf("chat ended")
+				}
+				if snip.GetType() != ytgrpc.LiveChatMessageSnippet_TEXT_MESSAGE_EVENT {
+					continue
+				}
+
+				ts, err := time.Parse(time.RFC3339Nano, snip.GetPublishedAt())
+				if err != nil {
+					ts = time.Now()
+				}
+
+				text := snip.GetDisplayMessage()
+				if d := snip.GetTextMessageDetails(); d != nil {
+					text = d.GetMessageText()
+				}
+
+				author := item.GetAuthorDetails()
+				var ytBadges []string
+				if author.GetIsChatOwner() {
+					ytBadges = append(ytBadges, "owner")
+				}
+				if author.GetIsChatModerator() {
+					ytBadges = append(ytBadges, "moderator")
+				}
+				if author.GetIsChatSponsor() {
+					ytBadges = append(ytBadges, "member")
+				}
+
+				select {
+				case <-ctx.Done():
+					return fmt.Errorf("stopped")
+				case out <- domain.ChatMessage{
+					Platform:  domain.PlatformYouTube,
+					Channel:   channelName,
+					ChannelID: videoID,
+					Username:  strings.TrimPrefix(author.GetDisplayName(), "@"),
+					Message:   text,
+					Badges:    ytBadges,
+					Timestamp: ts,
+				}:
+				}
+			}
+
+			if tok := resp.GetNextPageToken(); tok != "" {
+				pageToken = tok
+			}
+			if resp.GetOfflineAt() != "" {
+				return fmt.Errorf("chat offline at %s", resp.GetOfflineAt())
+			}
 		}
 	}
 }
